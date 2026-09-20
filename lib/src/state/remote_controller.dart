@@ -99,14 +99,27 @@ class RemoteController extends Notifier<RemoteState> {
           await _security.protocolFor(device.host);
 
       if (storedProtocol != null) {
-        final ok = await _connectCommand(
-          device,
-          storedProtocol,
-        );
-        if (ok) return;
+        // A TV can take a moment to reopen its remote-control service
+        // after waking or after the app reconnects. A single failed
+        // socket attempt must NOT erase a valid pairing.
+        for (var attempt = 0; attempt < 3; attempt++) {
+          final ok = await _connectCommand(
+            device,
+            storedProtocol,
+          );
+          if (ok) return;
+
+          if (attempt < 2) {
+            await Future<void>.delayed(
+              const Duration(milliseconds: 700),
+            );
+          }
+        }
       }
 
-      await _security.clearPairing(device.host);
+      // Keep the certificate and pairing marker. If the TV really asks
+      // to pair again, we can reuse the same identity instead of
+      // destroying a valid pairing after one transient failure.
     }
 
     final error =
@@ -168,21 +181,33 @@ class RemoteController extends Notifier<RemoteState> {
         device,
         pinLength: pinLength,
         error:
-            'Код не подошёл. Введи $pinLength символа с экрана ТВ.',
+            'X96 отклонила код. Введи код с экрана телевизора ещё раз.',
       );
       return;
     }
 
-    final connected = await _connectCommand(
-      device,
-      protocol,
-    );
-
-    if (!connected) {
-      state = const Disconnected(
-        'Pairing прошёл, но канал управления не открылся.',
+    // The command service can reopen a fraction of a second after
+    // pairing. Retry instead of immediately reporting a failure.
+    for (var attempt = 0; attempt < 4; attempt++) {
+      final connected = await _connectCommand(
+        device,
+        protocol,
       );
+
+      if (connected) {
+        return;
+      }
+
+      if (attempt < 3) {
+        await Future<void>.delayed(
+          const Duration(milliseconds: 700),
+        );
+      }
     }
+
+    state = const Disconnected(
+      'Pairing подтверждён, но X96 пока не открыла канал управления.',
+    );
   }
 
   Future<bool> _connectCommand(
