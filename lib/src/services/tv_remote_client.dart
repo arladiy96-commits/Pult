@@ -20,12 +20,24 @@ class TVRemoteClient {
   StreamSubscription<List<int>>? _subscription;
 
   final _buffer = <int>[];
+
+  // Used only for the old binary command protocol fallback.
   final Queue<Uint8List> _legacyFrames = Queue<Uint8List>();
-  Completer<Uint8List?>? _legacyWaiter;
+  Completer<bool>? _legacyConfigAck;
+
+  // Used while determining what protocol port 6466 actually speaks.
+  Completer<bool>? _v2Probe;
 
   bool _connected = false;
+  bool _probing = false;
   int? _activeRepeatCode;
-  TVRemoteProtocol _protocol = TVRemoteProtocol.remoteV2;
+
+  // IMPORTANT:
+  // Pairing protocol and command protocol are NOT assumed to be the same.
+  // Some older X96 / Android TV builds pair through the old pairing service
+  // but still speak protobuf Remote v2 on port 6466.
+  TVRemoteProtocol _commandProtocol = TVRemoteProtocol.remoteV2;
+
   Future<void> _legacyTail = Future.value();
 
   bool get isConnected => _connected;
@@ -35,14 +47,40 @@ class TVRemoteClient {
     int port = 6466,
     TVRemoteProtocol protocol = TVRemoteProtocol.remoteV2,
   }) async {
-    dispose();
-    _protocol = protocol;
+    // [protocol] is the PAIRING protocol stored by the app. It is only a hint.
+    // We independently detect the command protocol on port 6466.
+    _closeSocket(notify: false);
 
+    // First try the protocol used by current Android TV Remote Service:
+    // TLS + protobuf RemoteMessage on 6466.
+    final v2 = await _tryV2CommandChannel(ip, port);
+    if (v2) {
+      _commandProtocol = TVRemoteProtocol.remoteV2;
+      _connected = true;
+      return true;
+    }
+
+    // Only if port 6466 did not speak v2, try the older binary command format.
+    final legacy = await _tryLegacyCommandChannel(ip, port);
+    if (legacy) {
+      _commandProtocol = TVRemoteProtocol.legacyV1;
+      _connected = true;
+      return true;
+    }
+
+    _closeSocket(notify: false);
+    return false;
+  }
+
+  Future<bool> _tryV2CommandChannel(
+    String ip,
+    int port,
+  ) async {
     try {
       final context =
           await certManager.buildSecurityContext();
 
-      _socket = await SecureSocket.connect(
+      final socket = await SecureSocket.connect(
         ip,
         port,
         context: context,
@@ -50,37 +88,111 @@ class TVRemoteClient {
         onBadCertificate: (_) => true,
       );
 
-      _connected = true;
+      _socket = socket;
       _buffer.clear();
-      _legacyFrames.clear();
 
-      _subscription = _socket!.listen(
-        protocol == TVRemoteProtocol.legacyV1
-            ? _onLegacyData
-            : _onV2Data,
-        onError: (error) =>
-            _handleDisconnection('Ошибка соединения: $error'),
-        onDone: () =>
-            _handleDisconnection('Приставка закрыла соединение.'),
+      final probe = Completer<bool>();
+      _v2Probe = probe;
+      _probing = true;
+
+      _subscription = socket.listen(
+        _onV2Data,
+        onError: (_) {
+          if (!probe.isCompleted) {
+            probe.complete(false);
+          }
+        },
+        onDone: () {
+          if (!probe.isCompleted) {
+            probe.complete(false);
+          } else if (!_probing && _connected) {
+            _handleDisconnection(
+              'Приставка закрыла соединение.',
+            );
+          }
+        },
       );
 
-      // For legacy v1, a successful mutual-TLS connection on 6466
-      // is enough to treat the TV as paired. The reference protocol
-      // sends its configuration immediately before EACH key command.
-      // Requiring three configuration replies here made reconnects
-      // flaky and incorrectly forced a fresh pairing code.
+      // A genuine Remote v2 service normally sends RemoteConfigure /
+      // RemoteSetActive / RemoteStart immediately after TLS connects.
+      final detected = await probe.future
+          .timeout(
+            const Duration(seconds: 4),
+            onTimeout: () => false,
+          );
+
+      _v2Probe = null;
+      _probing = false;
+
+      if (!detected) {
+        _closeSocket(notify: false);
+        return false;
+      }
+
       return true;
-    } on SocketException catch (e) {
-      _handleDisconnection('Ошибка сети: ${e.message}');
+    } on SocketException {
+      _closeSocket(notify: false);
       return false;
     } on HandshakeException {
-      _handleDisconnection('Ошибка TLS.');
+      _closeSocket(notify: false);
       return false;
-    } catch (e) {
-      _handleDisconnection('Ошибка: $e');
+    } catch (_) {
+      _closeSocket(notify: false);
       return false;
     }
   }
+
+  Future<bool> _tryLegacyCommandChannel(
+    String ip,
+    int port,
+  ) async {
+    try {
+      final context =
+          await certManager.buildSecurityContext();
+
+      final socket = await SecureSocket.connect(
+        ip,
+        port,
+        context: context,
+        timeout: const Duration(seconds: 8),
+        onBadCertificate: (_) => true,
+      );
+
+      _socket = socket;
+      _buffer.clear();
+      _legacyFrames.clear();
+
+      _subscription = socket.listen(
+        _onLegacyData,
+        onError: (_) {},
+        onDone: () {
+          if (_connected) {
+            _handleDisconnection(
+              'Приставка закрыла соединение.',
+            );
+          }
+        },
+      );
+
+      // Verify the old command channel once. The old implementation's ACK
+      // is not protobuf and is not safely frameable by byte 3, so we look
+      // for its documented ACK signature in the incoming byte stream.
+      final ok = await _sendLegacyConfiguration();
+      if (!ok) {
+        _closeSocket(notify: false);
+        return false;
+      }
+
+      return true;
+    } catch (_) {
+      _closeSocket(notify: false);
+      return false;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Remote v2
+  // ---------------------------------------------------------------------------
 
   void _onV2Data(List<int> data) {
     _buffer.addAll(data);
@@ -108,6 +220,16 @@ class TVRemoteClient {
       }
 
       if (!complete) return;
+
+      // Reject an obviously impossible v2 frame while probing.
+      if (length < 0 || length > 1024 * 1024) {
+        final probe = _v2Probe;
+        if (probe != null && !probe.isCompleted) {
+          probe.complete(false);
+        }
+        return;
+      }
+
       if (_buffer.length < prefix + length) return;
 
       final message = Uint8List.fromList(
@@ -121,90 +243,109 @@ class TVRemoteClient {
 
   void _handleV2Message(Uint8List message) {
     final socket = _socket;
-    if (!_connected || socket == null) return;
+    if (socket == null) return;
 
     final incoming = RemoteMessage.parse(message);
+    final field = incoming.field;
 
-    switch (incoming.field) {
+    // These are valid RemoteMessage fields that prove port 6466 is v2.
+    const knownRemoteFields = <int>{
+      1,  // remote_configure
+      2,  // remote_set_active
+      3,  // remote_error
+      8,  // remote_ping_request
+      9,  // remote_ping_response
+      10, // remote_key_inject
+      20, 21, 22,
+      30, 31, 32,
+      40, // remote_start
+      50, 51,
+      60, 61,
+      90,
+    };
+
+    if (knownRemoteFields.contains(field)) {
+      final probe = _v2Probe;
+      if (probe != null && !probe.isCompleted) {
+        probe.complete(true);
+      }
+    }
+
+    // Handshake required by Android TV Remote v2.
+    switch (field) {
       case 1:
         socket.add(RemoteMessage.buildConfigure());
         break;
+
       case 2:
         socket.add(RemoteMessage.buildSetActive());
         break;
+
       case 8:
         socket.add(
-          RemoteMessage.buildPingResponse(incoming.pingVal),
+          RemoteMessage.buildPingResponse(
+            incoming.pingVal,
+          ),
         );
         break;
+
       default:
         break;
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Old command protocol fallback
+  // ---------------------------------------------------------------------------
+
   void _onLegacyData(List<int> data) {
     _buffer.addAll(data);
 
-    // Android TV Remote v1 binary command frames are:
-    // [1, TYPE, 0, PAYLOAD_LENGTH, ...PAYLOAD]
-    while (_buffer.length >= 4) {
-      if (_buffer[0] != 1 || _buffer[2] != 0) {
-        _buffer.removeAt(0);
-        continue;
+    // The old implementation checks only the first three ACK bytes:
+    // [1, 7, 0]. TCP/TLS chunking means those bytes may be inside a larger
+    // chunk, so search the stream instead of treating byte 3 as frame length.
+    if (_containsSequence(_buffer, const [1, 7, 0])) {
+      final ack = _legacyConfigAck;
+      if (ack != null && !ack.isCompleted) {
+        ack.complete(true);
       }
+    }
 
-      final payloadLength = _buffer[3];
-      final total = 4 + payloadLength;
-
-      if (_buffer.length < total) return;
-
-      final frame = Uint8List.fromList(
-        _buffer.sublist(0, total),
-      );
-      _buffer.removeRange(0, total);
-      _dispatchLegacyFrame(frame);
+    // Keep the buffer bounded. We only need recent bytes for ACK detection.
+    if (_buffer.length > 4096) {
+      _buffer.removeRange(0, _buffer.length - 1024);
     }
   }
 
-  void _dispatchLegacyFrame(Uint8List frame) {
-    final waiter = _legacyWaiter;
-
-    if (waiter != null && !waiter.isCompleted) {
-      _legacyWaiter = null;
-      waiter.complete(frame);
-      return;
+  bool _containsSequence(
+    List<int> source,
+    List<int> needle,
+  ) {
+    if (needle.isEmpty || source.length < needle.length) {
+      return false;
     }
 
-    _legacyFrames.addLast(frame);
-  }
+    for (var i = 0;
+        i <= source.length - needle.length;
+        i++) {
+      var match = true;
 
-  Future<Uint8List?> _readLegacyFrame({
-    Duration timeout = const Duration(seconds: 3),
-  }) async {
-    if (_legacyFrames.isNotEmpty) {
-      return _legacyFrames.removeFirst();
-    }
-
-    final waiter = Completer<Uint8List?>();
-    _legacyWaiter = waiter;
-
-    try {
-      return await waiter.future.timeout(timeout);
-    } on TimeoutException {
-      if (identical(_legacyWaiter, waiter)) {
-        _legacyWaiter = null;
+      for (var j = 0; j < needle.length; j++) {
+        if (source[i + j] != needle[j]) {
+          match = false;
+          break;
+        }
       }
-      return null;
-    } finally {
-      if (identical(_legacyWaiter, waiter)) {
-        _legacyWaiter = null;
-      }
+
+      if (match) return true;
     }
+
+    return false;
   }
 
   Future<bool> _sendLegacyConfiguration() async {
     final socket = _socket;
-    if (!_connected || socket == null) return false;
+    if (socket == null) return false;
 
     const configuration = <int>[
       1, 0, 0, 21,
@@ -216,51 +357,65 @@ class TVRemoteClient {
     ];
 
     try {
+      _buffer.clear();
+
+      final ack = Completer<bool>();
+      _legacyConfigAck = ack;
+
       socket.add(configuration);
       await socket.flush();
 
-      final ack1 = await _readLegacyFrame();
-      if (ack1 == null ||
-          ack1.length < 3 ||
-          ack1[0] != 1 ||
-          ack1[1] != 7 ||
-          ack1[2] != 0) {
-        return false;
+      final ok = await ack.future.timeout(
+        const Duration(seconds: 3),
+        onTimeout: () => false,
+      );
+
+      if (identical(_legacyConfigAck, ack)) {
+        _legacyConfigAck = null;
       }
 
-      final ack2 = await _readLegacyFrame();
-      if (ack2 == null) return false;
-
-      final ack3 = await _readLegacyFrame();
-      if (ack3 == null) return false;
-
-      return true;
+      return ok;
     } catch (_) {
+      _legacyConfigAck = null;
       return false;
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Public key commands
+  // ---------------------------------------------------------------------------
+
   void sendKeyPress(int code) {
-    if (_protocol == TVRemoteProtocol.legacyV1) {
+    if (_commandProtocol == TVRemoteProtocol.legacyV1) {
       _queueLegacy(() => _legacyShortKey(code));
       return;
     }
 
-    _sendV2Key(code, RemoteDirection.short);
+    _sendV2Key(
+      code,
+      RemoteDirection.short,
+    );
   }
 
   void startRepeat(int code) {
     _activeRepeatCode = code;
 
-    if (_protocol == TVRemoteProtocol.legacyV1) {
+    if (_commandProtocol == TVRemoteProtocol.legacyV1) {
       _queueLegacy(() async {
-        if (!await _sendLegacyConfiguration()) return;
+        if (!await _sendLegacyConfiguration()) {
+          throw StateError(
+            'нет ACK конфигурации старого протокола',
+          );
+        }
         _writeLegacyPress(code);
       });
       return;
     }
 
-    _sendV2Key(code, RemoteDirection.startLong);
+    _sendV2Key(
+      code,
+      RemoteDirection.startLong,
+    );
   }
 
   void stopRepeat() {
@@ -269,23 +424,33 @@ class TVRemoteClient {
 
     _activeRepeatCode = null;
 
-    if (_protocol == TVRemoteProtocol.legacyV1) {
+    if (_commandProtocol == TVRemoteProtocol.legacyV1) {
       _queueLegacy(() async {
         _writeLegacyRelease(code);
       });
       return;
     }
 
-    _sendV2Key(code, RemoteDirection.endLong);
+    _sendV2Key(
+      code,
+      RemoteDirection.endLong,
+    );
   }
 
-  void _sendV2Key(int code, int direction) {
+  void _sendV2Key(
+    int code,
+    int direction,
+  ) {
     final socket = _socket;
+
     if (!_connected || socket == null) return;
 
     try {
       socket.add(
-        RemoteMessage.buildKeyInject(code, direction),
+        RemoteMessage.buildKeyInject(
+          code,
+          direction,
+        ),
       );
     } catch (e) {
       _handleDisconnection(
@@ -294,7 +459,9 @@ class TVRemoteClient {
     }
   }
 
-  void _queueLegacy(Future<void> Function() operation) {
+  void _queueLegacy(
+    Future<void> Function() operation,
+  ) {
     final previous = _legacyTail;
 
     _legacyTail = () async {
@@ -316,13 +483,17 @@ class TVRemoteClient {
 
   Future<void> _legacyShortKey(int code) async {
     if (!await _sendLegacyConfiguration()) {
-      throw StateError('нет ACK конфигурации v1');
+      throw StateError(
+        'нет ACK конфигурации старого протокола',
+      );
     }
 
     _writeLegacyPress(code);
+
     await Future<void>.delayed(
       const Duration(milliseconds: 100),
     );
+
     _writeLegacyRelease(code);
   }
 
@@ -352,32 +523,25 @@ class TVRemoteClient {
     ]);
   }
 
+  // ---------------------------------------------------------------------------
+  // Cleanup
+  // ---------------------------------------------------------------------------
+
   void _handleDisconnection(String reason) {
     final wasConnected = _connected;
 
-    _connected = false;
-    _subscription?.cancel();
-    _subscription = null;
-
-    _socket?.destroy();
-    _socket = null;
-
-    _buffer.clear();
-    _legacyFrames.clear();
-
-    final waiter = _legacyWaiter;
-    _legacyWaiter = null;
-    if (waiter != null && !waiter.isCompleted) {
-      waiter.complete(null);
-    }
+    _closeSocket(notify: false);
 
     if (wasConnected) {
       onDisconnected?.call(reason);
     }
   }
 
-  void dispose() {
+  void _closeSocket({
+    required bool notify,
+  }) {
     _connected = false;
+    _probing = false;
     _activeRepeatCode = null;
 
     _subscription?.cancel();
@@ -389,12 +553,22 @@ class TVRemoteClient {
     _buffer.clear();
     _legacyFrames.clear();
 
-    final waiter = _legacyWaiter;
-    _legacyWaiter = null;
-    if (waiter != null && !waiter.isCompleted) {
-      waiter.complete(null);
+    final legacyAck = _legacyConfigAck;
+    _legacyConfigAck = null;
+    if (legacyAck != null && !legacyAck.isCompleted) {
+      legacyAck.complete(false);
+    }
+
+    final probe = _v2Probe;
+    _v2Probe = null;
+    if (probe != null && !probe.isCompleted) {
+      probe.complete(false);
     }
 
     _legacyTail = Future.value();
+  }
+
+  void dispose() {
+    _closeSocket(notify: false);
   }
 }
