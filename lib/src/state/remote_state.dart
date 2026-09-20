@@ -1,11 +1,11 @@
-import 'package:bonsoir/bonsoir.dart';
+import '../model/remote_device.dart';
 
 sealed class RemoteState {
   const RemoteState();
 }
 
 class Scanning extends RemoteState {
-  final List<BonsoirService> devices;
+  final List<RemoteDevice> devices;
 
   const Scanning({
     this.devices = const [],
@@ -13,13 +13,13 @@ class Scanning extends RemoteState {
 }
 
 class Connecting extends RemoteState {
-  final BonsoirService device;
+  final RemoteDevice device;
 
   const Connecting(this.device);
 }
 
 class PairingRequired extends RemoteState {
-  final BonsoirService device;
+  final RemoteDevice device;
   final String? error;
 
   const PairingRequired(
@@ -29,7 +29,7 @@ class PairingRequired extends RemoteState {
 }
 
 class Connected extends RemoteState {
-  final BonsoirService device;
+  final RemoteDevice device;
 
   const Connected(this.device);
 }
