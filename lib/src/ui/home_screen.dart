@@ -502,7 +502,7 @@ class _PairingScreenState extends State<_PairingScreen> {
           const SizedBox(height: 11),
           Text(
             'На ${widget.state.device.name} должен появиться '
-            '6‑символьный Android TV Pairing код.',
+            '${widget.state.pinLength}‑символьный Android TV Pairing код.',
             style: const TextStyle(
               color: _muted,
               fontSize: 15,
@@ -518,7 +518,7 @@ class _PairingScreenState extends State<_PairingScreen> {
               FilteringTextInputFormatter.allow(
                 RegExp('[0-9a-fA-F]'),
               ),
-              LengthLimitingTextInputFormatter(6),
+              LengthLimitingTextInputFormatter(widget.state.pinLength),
             ],
             style: const TextStyle(
               color: _text,
@@ -529,7 +529,7 @@ class _PairingScreenState extends State<_PairingScreen> {
             decoration: InputDecoration(
               filled: true,
               fillColor: _panel,
-              hintText: 'A1B2C3',
+              hintText: widget.state.pinLength == 4 ? 'A1B2' : 'A1B2C3',
               hintStyle: TextStyle(
                 color: _muted.withValues(alpha: 0.28),
                 fontSize: 30,
