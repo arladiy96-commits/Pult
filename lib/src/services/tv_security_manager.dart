@@ -313,17 +313,17 @@ class TVSecurityManager {
         return false;
       }
 
+      // Android TV Remote v1 uses a 4-symbol HEX code.
+      // The pairing hash contains ONLY the last two HEX symbols
+      // (one nonce byte). Do not reject the code locally: older
+      // implementations do not guarantee that the first byte is a
+      // locally-verifiable checksum. The TV itself is authoritative
+      // and accepts/rejects the secret with type 41 / BAD_SECRET.
       final secret = await _buildPairingSecret(
         normalized,
         nonceStart: 2,
       );
       if (secret == null) return false;
-
-      final checkByte =
-          int.parse(normalized.substring(0, 2), radix: 16);
-      if (secret.first != checkByte) {
-        return false;
-      }
 
       await _sendLegacyJson({
         'protocol_version': 1,
@@ -335,7 +335,7 @@ class TVSecurityManager {
       });
 
       final ack = await _readLegacyResponse(
-        timeout: const Duration(seconds: 8),
+        timeout: const Duration(seconds: 10),
       );
 
       if (!_legacyResponseIs(ack, 41)) {
@@ -358,29 +358,36 @@ class TVSecurityManager {
     try {
       final normalized = _normalizeHexPin(pin);
 
-      if (!RegExp(r'^[0-9A-F]{6}$').hasMatch(normalized)) {
+      // Different Android TV Remote Service builds expose the v2
+      // challenge as either the full 6 HEX symbols or allow entering
+      // just the final 4. In both cases the SHA-256 input uses the
+      // final four HEX symbols (two nonce bytes).
+      final valid = RegExp(r'^[0-9A-F]{4}$').hasMatch(normalized) ||
+          RegExp(r'^[0-9A-F]{6}$').hasMatch(normalized);
+
+      if (!valid) {
         return false;
       }
 
+      final nonceCode = normalized.length == 6
+          ? normalized.substring(2)
+          : normalized;
+
       final secret = await _buildPairingSecret(
-        normalized,
-        nonceStart: 2,
+        nonceCode,
+        nonceStart: 0,
       );
       if (secret == null) return false;
 
-      final checkByte =
-          int.parse(normalized.substring(0, 2), radix: 16);
-      if (secret.first != checkByte) {
-        return false;
-      }
-
+      // Let the TV validate the pairing secret. This is more compatible
+      // than rejecting locally based on the first displayed byte.
       _pairingSocket!.add(
         PairingMessage.buildSecret(secret),
       );
       await _pairingSocket!.flush();
 
       final ack = await _readNextMessage(
-        timeout: const Duration(seconds: 8),
+        timeout: const Duration(seconds: 10),
       );
 
       final response = ack == null

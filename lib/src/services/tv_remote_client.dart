@@ -64,16 +64,11 @@ class TVRemoteClient {
             _handleDisconnection('Приставка закрыла соединение.'),
       );
 
-      if (protocol == TVRemoteProtocol.legacyV1) {
-        final verified = await _sendLegacyConfiguration();
-        if (!verified) {
-          _handleDisconnection(
-            'X96 не подтвердила канал управления v1.',
-          );
-          return false;
-        }
-      }
-
+      // For legacy v1, a successful mutual-TLS connection on 6466
+      // is enough to treat the TV as paired. The reference protocol
+      // sends its configuration immediately before EACH key command.
+      // Requiring three configuration replies here made reconnects
+      // flaky and incorrectly forced a fresh pairing code.
       return true;
     } on SocketException catch (e) {
       _handleDisconnection('Ошибка сети: ${e.message}');
