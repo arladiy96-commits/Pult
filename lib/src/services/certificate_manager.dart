@@ -1,5 +1,4 @@
 import 'dart:convert';
-import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:basic_utils/basic_utils.dart';
@@ -11,8 +10,10 @@ Map<String, String> _generateKeypairAndCert(int keySize) {
   final publicKey = pair.publicKey as RSAPublicKey;
   final privateKey = pair.privateKey as RSAPrivateKey;
 
+  const identityName = 'androidtvremote';
+
   final csrPem = X509Utils.generateRsaCsrPem(
-    {'CN': 'x96-remote'},
+    {'CN': identityName},
     privateKey,
     publicKey,
   );
@@ -21,6 +22,13 @@ Map<String, String> _generateKeypairAndCert(int keySize) {
     privateKey,
     csrPem,
     3650,
+    sans: const [identityName],
+    cA: true,
+    pathLenConstraint: 0,
+    serialNumber: '1000',
+    notBefore: DateTime.now().toUtc().subtract(
+          const Duration(minutes: 5),
+        ),
   );
 
   final keyPem = CryptoUtils.encodeRSAPrivateKeyToPem(privateKey);
@@ -32,8 +40,9 @@ Map<String, String> _generateKeypairAndCert(int keySize) {
 }
 
 class CertificateManager {
-  static const _certKey = 'x96_client_cert_v1';
-  static const _keyKey = 'x96_client_key_v1';
+  // v2 intentionally forces regeneration of the old minimal certificate.
+  static const _certKey = 'x96_client_cert_v2';
+  static const _keyKey = 'x96_client_key_v2';
 
   final _storage = const FlutterSecureStorage();
 
