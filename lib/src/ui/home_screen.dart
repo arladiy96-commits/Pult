@@ -855,7 +855,7 @@ class _DPad extends StatelessWidget {
         builder: (context, constraints) {
           final size = math.min(
             constraints.maxWidth,
-            math.min(constraints.maxHeight, 330),
+            math.min(constraints.maxHeight, 330.0),
           );
 
           return SizedBox(
