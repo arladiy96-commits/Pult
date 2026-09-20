@@ -20,10 +20,12 @@ class Connecting extends RemoteState {
 
 class PairingRequired extends RemoteState {
   final RemoteDevice device;
+  final int pinLength;
   final String? error;
 
   const PairingRequired(
     this.device, {
+    required this.pinLength,
     this.error,
   });
 }

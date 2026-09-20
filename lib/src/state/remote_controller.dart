@@ -5,6 +5,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 import '../model/remote_device.dart';
+import '../model/remote_protocol.dart';
 import '../services/certificate_manager.dart';
 import '../services/tv_discovery_service.dart';
 import '../services/tv_remote_client.dart';
@@ -49,12 +50,7 @@ class RemoteController extends Notifier<RemoteState> {
   Future<void> _requestLocalNetworkPermissions() async {
     if (!Platform.isAndroid) return;
 
-    // Android 13+ / Android 16 local-network protection.
     await Permission.nearbyWifiDevices.request();
-
-    // Backward compatibility for Android 12L and older.
-    // On newer Android versions this permission is capped in the manifest,
-    // so the request is effectively ignored.
     await Permission.locationWhenInUse.request();
   }
 
@@ -99,8 +95,16 @@ class RemoteController extends Notifier<RemoteState> {
         await _security.hasPairedStorage(device.host);
 
     if (paired) {
-      final ok = await _connectCommand(device);
-      if (ok) return;
+      final storedProtocol =
+          await _security.protocolFor(device.host);
+
+      if (storedProtocol != null) {
+        final ok = await _connectCommand(
+          device,
+          storedProtocol,
+        );
+        if (ok) return;
+      }
 
       await _security.clearPairing(device.host);
     }
@@ -109,7 +113,10 @@ class RemoteController extends Notifier<RemoteState> {
         await _security.initiatePairing(device.host);
 
     if (error == null) {
-      state = PairingRequired(device);
+      state = PairingRequired(
+        device,
+        pinLength: _security.currentPinLength,
+      );
     } else {
       state = Disconnected(error);
     }
@@ -142,7 +149,11 @@ class RemoteController extends Notifier<RemoteState> {
 
   Future<void> submitPin(String pin) async {
     final device = _activeDevice;
-    if (device == null) return;
+    final protocol = _security.currentProtocol;
+
+    if (device == null || protocol == null) return;
+
+    final pinLength = protocol.pinLength;
 
     state = Connecting(device);
 
@@ -155,13 +166,17 @@ class RemoteController extends Notifier<RemoteState> {
     if (!success) {
       state = PairingRequired(
         device,
+        pinLength: pinLength,
         error:
-            'Код не подошёл. Введи 6 символов с экрана ТВ.',
+            'Код не подошёл. Введи $pinLength символа с экрана ТВ.',
       );
       return;
     }
 
-    final connected = await _connectCommand(device);
+    final connected = await _connectCommand(
+      device,
+      protocol,
+    );
 
     if (!connected) {
       state = const Disconnected(
@@ -172,6 +187,7 @@ class RemoteController extends Notifier<RemoteState> {
 
   Future<bool> _connectCommand(
     RemoteDevice device,
+    TVRemoteProtocol protocol,
   ) async {
     _client?.dispose();
 
@@ -189,6 +205,7 @@ class RemoteController extends Notifier<RemoteState> {
     final ok = await client.connect(
       device.host,
       port: device.port,
+      protocol: protocol,
     );
 
     if (ok && !_disposed) {
