@@ -2,10 +2,6 @@ name: Build APK
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-      - master
 
 jobs:
   build:
@@ -27,8 +23,8 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Flutter version
-        run: flutter --version
+      - name: Flutter doctor
+        run: flutter doctor -v
 
       - name: Get dependencies
         run: flutter pub get
@@ -37,9 +33,31 @@ jobs:
         run: flutter analyze --no-fatal-warnings --no-fatal-infos
 
       - name: Build release APK
-        run: flutter build apk --release
+        shell: bash
+        run: |
+          set -o pipefail
+          flutter build apk --release -v 2>&1 | tee build_apk.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            echo ""
+            echo "========== IMPORTANT ERROR LINES =========="
+            grep -nEi "FAILURE:|What went wrong|Execution failed|error:|Exception|Manifest merger|AAPT|Could not|failed" build_apk.log | tail -n 120 || true
+            echo ""
+            echo "========== LAST 250 LOG LINES =========="
+            tail -n 250 build_apk.log || true
+            exit "$status"
+          fi
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: x96-build-log
+          path: build_apk.log
+          if-no-files-found: warn
 
       - name: Upload APK artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: x96-remote-apk
