@@ -1,10 +1,10 @@
 import 'dart:math' as math;
 
-import 'package:bonsoir/bonsoir.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../model/remote_device.dart';
 import '../state/remote_controller.dart';
 import '../state/remote_state.dart';
 
@@ -56,6 +56,7 @@ class HomeScreen extends ConsumerWidget {
                 state: state,
                 onConnect: controller.connect,
                 onRefresh: controller.scan,
+                onManual: controller.connectManual,
               ),
             Connecting() => _ConnectingScreen(
                 key: const ValueKey('connecting'),
@@ -87,17 +88,34 @@ class HomeScreen extends ConsumerWidget {
   }
 }
 
-class _ScanningScreen extends StatelessWidget {
+
+class _ScanningScreen extends StatefulWidget {
   const _ScanningScreen({
     super.key,
     required this.state,
     required this.onConnect,
     required this.onRefresh,
+    required this.onManual,
   });
 
   final Scanning state;
-  final Future<void> Function(BonsoirService) onConnect;
+  final Future<void> Function(RemoteDevice) onConnect;
   final VoidCallback onRefresh;
+  final Future<void> Function(String) onManual;
+
+  @override
+  State<_ScanningScreen> createState() => _ScanningScreenState();
+}
+
+class _ScanningScreenState extends State<_ScanningScreen> {
+  final _ipController = TextEditingController();
+  bool _manualOpen = false;
+
+  @override
+  void dispose() {
+    _ipController.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -108,7 +126,7 @@ class _ScanningScreen extends StatelessWidget {
         children: [
           _TopBar(
             trailing: IconButton(
-              onPressed: onRefresh,
+              onPressed: widget.onRefresh,
               color: _muted,
               icon: const Icon(Icons.refresh_rounded),
             ),
@@ -135,19 +153,88 @@ class _ScanningScreen extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 28),
-          if (state.devices.isEmpty)
+          if (widget.state.devices.isEmpty)
             const _SearchingCard()
           else
-            ...state.devices.map(
+            ...widget.state.devices.map(
               (device) => Padding(
                 padding: const EdgeInsets.only(bottom: 12),
                 child: _DeviceCard(
                   name: device.name,
-                  host: device.host ?? 'IP определяется…',
-                  onTap: () => onConnect(device),
+                  host: device.host,
+                  onTap: () => widget.onConnect(device),
                 ),
               ),
             ),
+          const SizedBox(height: 10),
+          TextButton.icon(
+            onPressed: () {
+              setState(() => _manualOpen = !_manualOpen);
+            },
+            icon: const Icon(Icons.router_rounded, size: 19),
+            label: const Text('Подключить по IP'),
+            style: TextButton.styleFrom(
+              foregroundColor: _muted,
+            ),
+          ),
+          AnimatedCrossFade(
+            duration: const Duration(milliseconds: 180),
+            crossFadeState: _manualOpen
+                ? CrossFadeState.showFirst
+                : CrossFadeState.showSecond,
+            firstChild: Padding(
+              padding: const EdgeInsets.only(top: 8),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _ipController,
+                      keyboardType:
+                          const TextInputType.numberWithOptions(
+                        decimal: true,
+                      ),
+                      style: const TextStyle(color: _text),
+                      decoration: InputDecoration(
+                        hintText: '192.168.1.120',
+                        hintStyle: const TextStyle(color: _muted),
+                        filled: true,
+                        fillColor: _panel,
+                        contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 15,
+                        ),
+                        enabledBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(16),
+                          borderSide:
+                              const BorderSide(color: _line),
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(16),
+                          borderSide:
+                              const BorderSide(color: _accent),
+                        ),
+                      ),
+                      onSubmitted: widget.onManual,
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  IconButton.filled(
+                    onPressed: () =>
+                        widget.onManual(_ipController.text),
+                    icon: const Icon(
+                      Icons.arrow_forward_rounded,
+                    ),
+                    style: IconButton.styleFrom(
+                      minimumSize: const Size(54, 54),
+                      backgroundColor: _accent,
+                      foregroundColor: _bg,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            secondChild: const SizedBox.shrink(),
+          ),
           const Spacer(),
           const _Footer(),
         ],
