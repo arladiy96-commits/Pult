@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
@@ -21,7 +22,13 @@ class TVSecurityManager {
   SecureSocket? _pairingSocket;
   Uint8List? _serverCertDer;
   final _buffer = <int>[];
-  final _pending = StreamController<Uint8List>.broadcast();
+
+  // Pairing replies can arrive extremely quickly on a local network.
+  // A broadcast StreamController drops events when nobody is listening.
+  // Keep complete protobuf frames in a queue instead so no ACK is lost.
+  final Queue<Uint8List> _pendingMessages = Queue<Uint8List>();
+  Completer<Uint8List?>? _messageWaiter;
+
   StreamSubscription<List<int>>? _socketSubscription;
 
   String _key(String ip) => 'x96_paired_$ip';
@@ -74,7 +81,7 @@ class TVSecurityManager {
       await _pairingSocket!.flush();
 
       final ack1 = await _readNextMessage(
-        timeout: const Duration(seconds: 5),
+        timeout: const Duration(seconds: 10),
       );
       if (ack1 == null ||
           PairingMessage.parseResponseField(ack1) < 0) {
@@ -86,7 +93,7 @@ class TVSecurityManager {
       await _pairingSocket!.flush();
 
       final ack2 = await _readNextMessage(
-        timeout: const Duration(seconds: 5),
+        timeout: const Duration(seconds: 10),
       );
       if (ack2 == null ||
           PairingMessage.parseResponseField(ack2) < 0) {
@@ -98,7 +105,7 @@ class TVSecurityManager {
       await _pairingSocket!.flush();
 
       final ack3 = await _readNextMessage(
-        timeout: const Duration(seconds: 6),
+        timeout: const Duration(seconds: 10),
       );
       if (ack3 == null) {
         _cleanupSocket();
@@ -302,11 +309,18 @@ class TVSecurityManager {
 
   void dispose() {
     _cleanupSocket();
-    _pending.close();
   }
 
   void _attachSocketReader(SecureSocket socket) {
     _buffer.clear();
+    _pendingMessages.clear();
+
+    final oldWaiter = _messageWaiter;
+    _messageWaiter = null;
+    if (oldWaiter != null && !oldWaiter.isCompleted) {
+      oldWaiter.complete(null);
+    }
+
     _socketSubscription?.cancel();
 
     _socketSubscription = socket.listen(
@@ -346,17 +360,43 @@ class TVSecurityManager {
       );
 
       _buffer.removeRange(0, prefix + len);
-      _pending.add(message);
+      _dispatchMessage(message);
     }
+  }
+
+  void _dispatchMessage(Uint8List message) {
+    final waiter = _messageWaiter;
+
+    if (waiter != null && !waiter.isCompleted) {
+      _messageWaiter = null;
+      waiter.complete(message);
+      return;
+    }
+
+    _pendingMessages.addLast(message);
   }
 
   Future<Uint8List?> _readNextMessage({
     required Duration timeout,
   }) async {
+    if (_pendingMessages.isNotEmpty) {
+      return _pendingMessages.removeFirst();
+    }
+
+    final waiter = Completer<Uint8List?>();
+    _messageWaiter = waiter;
+
     try {
-      return await _pending.stream.first.timeout(timeout);
+      return await waiter.future.timeout(timeout);
     } on TimeoutException {
+      if (identical(_messageWaiter, waiter)) {
+        _messageWaiter = null;
+      }
       return null;
+    } finally {
+      if (identical(_messageWaiter, waiter)) {
+        _messageWaiter = null;
+      }
     }
   }
 
@@ -369,5 +409,12 @@ class TVSecurityManager {
 
     _serverCertDer = null;
     _buffer.clear();
+    _pendingMessages.clear();
+
+    final waiter = _messageWaiter;
+    _messageWaiter = null;
+    if (waiter != null && !waiter.isCompleted) {
+      waiter.complete(null);
+    }
   }
 }
