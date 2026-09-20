@@ -27,7 +27,7 @@ class TVDiscoveryService {
     _devices.clear();
     _controller.add(const []);
 
-    // 1) Standard Android TV mDNS discovery.
+    // 1) Standard Android TV Remote Service discovery via mDNS.
     try {
       final discovery = BonsoirDiscovery(type: _serviceType);
       _discovery = discovery;
@@ -46,9 +46,8 @@ class TVDiscoveryService {
               RemoteDevice(
                 name: event.service.name,
                 host: _normalizeHost(host),
-                port: event.service.port == 0
-                    ? 6466
-                    : event.service.port,
+                // Commands normally use 6466.
+                port: 6466,
               ),
             );
 
@@ -66,13 +65,12 @@ class TVDiscoveryService {
 
       await discovery.start();
     } catch (_) {
-      // Do not fail the whole search. The subnet fallback below
-      // can still find the X96 even if mDNS is blocked/broken.
+      // Continue with direct subnet scan below.
     }
 
-    // 2) Fallback: scan the current Wi-Fi /24 subnet for the
-    // Android TV Remote Service command port (6466).
-    // This avoids relying only on multicast/mDNS.
+    // 2) Fallback: scan the current Wi-Fi subnet directly.
+    // We test BOTH standard Android TV Remote ports:
+    // 6467 = pairing, 6466 = remote commands.
     unawaited(_scanLocalSubnets());
   }
 
@@ -97,17 +95,30 @@ class TVDiscoveryService {
         }
       }
 
+      // Normal path: scan the subnet(s) the phone is actually on.
       for (final prefix in prefixes) {
         if (_stopped) return;
         await _scan24(prefix);
       }
+
+      // Extra fallback for common home-router ranges if Android did not
+      // expose a useful Wi-Fi IPv4 interface for some reason.
+      if (prefixes.isEmpty) {
+        for (final prefix in const [
+          '192.168.0',
+          '192.168.1',
+        ]) {
+          if (_stopped) return;
+          await _scan24(prefix);
+        }
+      }
     } catch (_) {
-      // mDNS may still succeed, and manual IP remains available.
+      // mDNS and manual IP are still available.
     }
   }
 
   Future<void> _scan24(String prefix) async {
-    const batchSize = 32;
+    const batchSize = 24;
 
     for (var start = 1; start <= 254; start += batchSize) {
       if (_stopped) return;
@@ -127,23 +138,46 @@ class TVDiscoveryService {
   Future<void> _probeHost(String ip) async {
     if (_stopped) return;
 
-    Socket? socket;
-    try {
-      socket = await Socket.connect(
-        ip,
-        6466,
-        timeout: const Duration(milliseconds: 180),
-      );
+    // Pairing port first: an unpaired Android TV may expose 6467
+    // even when 6466 is not accepting a normal remote session yet.
+    final pairingOpen = await _isPortOpen(ip, 6467);
 
+    if (pairingOpen) {
       _addDevice(
         RemoteDevice(
-          name: 'X96 / Android TV',
+          name: 'Android TV / X96',
           host: ip,
           port: 6466,
         ),
       );
+      return;
+    }
+
+    final remoteOpen = await _isPortOpen(ip, 6466);
+
+    if (remoteOpen) {
+      _addDevice(
+        RemoteDevice(
+          name: 'Android TV / X96',
+          host: ip,
+          port: 6466,
+        ),
+      );
+    }
+  }
+
+  Future<bool> _isPortOpen(String ip, int port) async {
+    Socket? socket;
+
+    try {
+      socket = await Socket.connect(
+        ip,
+        port,
+        timeout: const Duration(milliseconds: 350),
+      );
+      return true;
     } catch (_) {
-      // No Android TV Remote Service on this address.
+      return false;
     } finally {
       socket?.destroy();
     }
@@ -152,12 +186,11 @@ class TVDiscoveryService {
   void _addDevice(RemoteDevice device) {
     if (_stopped) return;
 
-    // Key by IP so an mDNS result can replace the generic
-    // subnet-scan result for the same device.
     final existing = _devices[device.host];
 
+    // Prefer the real mDNS name over the generic scan name.
     if (existing == null ||
-        existing.name == 'X96 / Android TV') {
+        existing.name == 'Android TV / X96') {
       _devices[device.host] = device;
       _emit();
     }
@@ -175,8 +208,6 @@ class TVDiscoveryService {
   String _normalizeHost(String host) {
     var value = host.trim();
 
-    // Bonsoir can occasionally return a hostname instead of an IP.
-    // Keep it as-is; Dart can resolve .local hostnames on many devices.
     if (value.endsWith('.')) {
       value = value.substring(0, value.length - 1);
     }
