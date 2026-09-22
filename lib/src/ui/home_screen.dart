@@ -610,7 +610,6 @@ class _PairingScreenState extends State<_PairingScreen> {
 
 class _RemoteScreen extends StatefulWidget {
   const _RemoteScreen({
-    super.key,
     required this.name,
     required this.onKey,
     required this.onStartRepeat,

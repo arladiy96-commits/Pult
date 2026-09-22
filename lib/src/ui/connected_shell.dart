@@ -741,7 +741,7 @@ class _SettingTile extends StatelessWidget {
       onTap: onTap,
       borderRadius: BorderRadius.circular(18),
       child: Container(
-        minHeight: 62,
+        constraints: const BoxConstraints(minHeight: 62),
         padding: const EdgeInsets.symmetric(horizontal: 15, vertical: 10),
         decoration: BoxDecoration(borderRadius: BorderRadius.circular(18), border: Border.all(color: _line)),
         child: Row(children: [
