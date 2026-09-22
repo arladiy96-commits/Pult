@@ -169,6 +169,39 @@ class RemoteMessage {
         ),
       );
 
+  static Uint8List buildAppLink(String appLink) =>
+      frameMessage(
+        _bytesField(
+          90,
+          _strField(1, appLink),
+        ),
+      );
+
+  static Uint8List buildImeBatchEdit({
+    required int imeCounter,
+    required int fieldCounter,
+    required String text,
+  }) {
+    final imeObject = [
+      ..._int32Field(1, text.isEmpty ? 0 : text.length - 1),
+      ..._int32Field(2, text.isEmpty ? 0 : text.length - 1),
+      ..._strField(3, text),
+    ];
+
+    final editInfo = [
+      ..._int32Field(1, 1),
+      ..._bytesField(2, imeObject),
+    ];
+
+    final batch = [
+      ..._int32Field(1, imeCounter),
+      ..._int32Field(2, fieldCounter),
+      ..._bytesField(3, editInfo),
+    ];
+
+    return frameMessage(_bytesField(21, batch));
+  }
+
   static RemoteIncoming parse(Uint8List data) {
     int i = 0;
 
@@ -203,11 +236,22 @@ class RemoteMessage {
 
         if (i + len > data.length) return const RemoteIncoming(field: -1);
 
+        final payload = Uint8List.fromList(
+          data.sublist(i, i + len),
+        );
+
         if (field == 8) {
-          final pingVal = _firstVarintValue(
-            Uint8List.fromList(data.sublist(i, i + len)),
-          );
+          final pingVal = _firstVarintValue(payload);
           return RemoteIncoming(field: 8, pingVal: pingVal);
+        }
+
+        if (field == 21) {
+          final counters = _readFirstTwoVarints(payload);
+          return RemoteIncoming(
+            field: 21,
+            imeCounter: counters.$1,
+            imeFieldCounter: counters.$2,
+          );
         }
 
         return RemoteIncoming(field: field);
@@ -217,6 +261,42 @@ class RemoteMessage {
     }
 
     return const RemoteIncoming(field: -1);
+  }
+
+  static (int, int) _readFirstTwoVarints(Uint8List data) {
+    int i = 0;
+    int first = 0;
+    int second = 0;
+
+    while (i < data.length) {
+      int tag = 0;
+      int shift = 0;
+      while (i < data.length) {
+        final b = data[i++];
+        tag |= (b & 0x7F) << shift;
+        if ((b & 0x80) == 0) break;
+        shift += 7;
+      }
+
+      final field = tag >> 3;
+      final wire = tag & 7;
+      if (wire != 0) break;
+
+      int value = 0;
+      shift = 0;
+      while (i < data.length) {
+        final b = data[i++];
+        value |= (b & 0x7F) << shift;
+        if ((b & 0x80) == 0) break;
+        shift += 7;
+      }
+
+      if (field == 1) first = value;
+      if (field == 2) second = value;
+      if (first != 0 && second != 0) break;
+    }
+
+    return (first, second);
   }
 
   static int _firstVarintValue(Uint8List data) {
@@ -239,9 +319,13 @@ class RemoteMessage {
 class RemoteIncoming {
   final int field;
   final int pingVal;
+  final int imeCounter;
+  final int imeFieldCounter;
 
   const RemoteIncoming({
     required this.field,
     this.pingVal = 0,
+    this.imeCounter = 0,
+    this.imeFieldCounter = 0,
   });
 }
