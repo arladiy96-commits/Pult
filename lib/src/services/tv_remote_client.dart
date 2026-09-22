@@ -31,6 +31,8 @@ class TVRemoteClient {
   bool _connected = false;
   bool _probing = false;
   int? _activeRepeatCode;
+  int _imeCounter = 0;
+  int _imeFieldCounter = 0;
 
   // IMPORTANT:
   // Pairing protocol and command protocol are NOT assumed to be the same.
@@ -271,6 +273,11 @@ class TVRemoteClient {
       }
     }
 
+    if (field == 21) {
+      _imeCounter = incoming.imeCounter;
+      _imeFieldCounter = incoming.imeFieldCounter;
+    }
+
     // Handshake required by Android TV Remote v2.
     switch (field) {
       case 1:
@@ -384,6 +391,38 @@ class TVRemoteClient {
   // ---------------------------------------------------------------------------
   // Public key commands
   // ---------------------------------------------------------------------------
+
+  bool launchAppLink(String appLink) {
+    final socket = _socket;
+    if (!_connected || socket == null) return false;
+    if (_commandProtocol != TVRemoteProtocol.remoteV2) return false;
+
+    try {
+      socket.add(RemoteMessage.buildAppLink(appLink));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  bool sendText(String text) {
+    final socket = _socket;
+    if (!_connected || socket == null || text.isEmpty) return false;
+    if (_commandProtocol != TVRemoteProtocol.remoteV2) return false;
+
+    try {
+      socket.add(
+        RemoteMessage.buildImeBatchEdit(
+          imeCounter: _imeCounter,
+          fieldCounter: _imeFieldCounter,
+          text: text,
+        ),
+      );
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
 
   void sendKeyPress(int code) {
     if (_commandProtocol == TVRemoteProtocol.legacyV1) {
