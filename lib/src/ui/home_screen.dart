@@ -7,6 +7,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../model/remote_device.dart';
 import '../state/remote_controller.dart';
 import '../state/remote_state.dart';
+import 'connected_shell.dart';
 
 const _bg = Color(0xFF07090D);
 const _panel = Color(0xFF11161E);
@@ -68,13 +69,15 @@ class HomeScreen extends ConsumerWidget {
                 onSubmit: controller.submitPin,
                 onCancel: controller.scan,
               ),
-            Connected() => _RemoteScreen(
-                key: const ValueKey('remote'),
+            Connected() => ConnectedShell(
+                key: const ValueKey('remote-v2-ui'),
                 name: state.device.name,
                 onKey: controller.sendKey,
                 onStartRepeat: controller.startRepeat,
                 onStopRepeat: controller.stopRepeat,
                 onForget: controller.forgetAndScan,
+                onLaunchApp: controller.launchApp,
+                onSendText: controller.sendText,
               ),
             Disconnected() => _ErrorScreen(
                 key: const ValueKey('error'),
