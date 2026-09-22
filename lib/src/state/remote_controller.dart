@@ -245,6 +245,14 @@ class RemoteController extends Notifier<RemoteState> {
     _client?.sendKeyPress(keyCode);
   }
 
+  bool launchApp(String appLink) {
+    return _client?.launchAppLink(appLink) ?? false;
+  }
+
+  bool sendText(String text) {
+    return _client?.sendText(text) ?? false;
+  }
+
   void startRepeat(int keyCode) {
     _client?.startRepeat(keyCode);
   }
