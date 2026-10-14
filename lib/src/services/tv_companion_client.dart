@@ -65,6 +65,9 @@ class TvCompanionClient {
     }
     _socket = socket;
     _subscription = socket
+        // SecureSocket emits Uint8List; Utf8Decoder requires List<int>.
+        // The mapped bytes are the same underlying data (no copy).
+        .map<List<int>>((bytes) => bytes)
         .transform(utf8.decoder)
         .transform(const LineSplitter())
         .listen((line) {
