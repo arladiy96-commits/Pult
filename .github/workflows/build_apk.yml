@@ -1,5 +1,8 @@
 name: Build APK
 
+permissions:
+  contents: write
+
 on:
   workflow_dispatch:
 
@@ -63,3 +66,15 @@ jobs:
           name: x96-remote-apk
           path: build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
+
+      - name: Attach phone APK to GitHub Releases
+        if: success()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp build/app/outputs/flutter-apk/app-release.apk Pult-Phone.apk
+          gh release create "pult-phone-test-${{ github.run_number }}" Pult-Phone.apk \
+            --title "Pult Phone · Test #${{ github.run_number }}" \
+            --notes 'Android phone remote. Use Pult-TV on the X96 for extended features.' \
+            --target "${{ github.sha }}" --prerelease
