@@ -72,6 +72,7 @@ class HomeScreen extends ConsumerWidget {
             Connected() => ConnectedShell(
                 key: const ValueKey('remote-v2-ui'),
                 name: state.device.name,
+                host: state.device.host,
                 onKey: controller.sendKey,
                 onStartRepeat: controller.startRepeat,
                 onStopRepeat: controller.stopRepeat,

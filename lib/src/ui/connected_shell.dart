@@ -3,6 +3,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'tv_companion_screen.dart';
 
 const _bg = Color(0xFF05090E);
 const _panel = Color(0xFF0B1620);
@@ -38,6 +39,7 @@ class ConnectedShell extends StatefulWidget {
   const ConnectedShell({
     super.key,
     required this.name,
+    required this.host,
     required this.onKey,
     required this.onStartRepeat,
     required this.onStopRepeat,
@@ -47,6 +49,7 @@ class ConnectedShell extends StatefulWidget {
   });
 
   final String name;
+  final String host;
   final ValueChanged<int> onKey;
   final ValueChanged<int> onStartRepeat;
   final VoidCallback onStopRepeat;
@@ -63,6 +66,12 @@ class _ConnectedShellState extends State<ConnectedShell> {
   int _remoteMode = 0;
   bool _haptics = true;
   double _mouseSensitivity = 0.55;
+
+  void _openCompanion() {
+    Navigator.of(context).push(MaterialPageRoute<void>(
+      builder: (_) => TvCompanionScreen(host: widget.host),
+    ));
+  }
 
   void _tap(int key) {
     if (_haptics) HapticFeedback.selectionClick();
@@ -117,8 +126,10 @@ class _ConnectedShellState extends State<ConnectedShell> {
                   onStartRepeat: widget.onStartRepeat,
                   onStopRepeat: widget.onStopRepeat,
                   mouseSensitivity: _mouseSensitivity,
+                  onCompanionOpen: _openCompanion,
                 ),
                 _AppsPage(
+                  onCompanionOpen: _openCompanion,
                   onLaunch: (target) {
                     final ok = widget.onLaunchApp(target.link);
                     _toast(
@@ -129,6 +140,7 @@ class _ConnectedShellState extends State<ConnectedShell> {
                   },
                 ),
                 _KeyboardPage(
+                  onCompanionOpen: _openCompanion,
                   onSend: (text) {
                     final ok = widget.onSendText(text);
                     _toast(
@@ -149,6 +161,7 @@ class _ConnectedShellState extends State<ConnectedShell> {
                   onHaptics: (v) => setState(() => _haptics = v),
                   onSensitivity: (v) => setState(() => _mouseSensitivity = v),
                   onReconnect: widget.onForget,
+                  onCompanionOpen: _openCompanion,
                 ),
               ],
             ),
@@ -277,6 +290,7 @@ class _RemotePage extends StatelessWidget {
     required this.onStartRepeat,
     required this.onStopRepeat,
     required this.mouseSensitivity,
+    required this.onCompanionOpen,
   });
 
   final int mode;
@@ -285,6 +299,7 @@ class _RemotePage extends StatelessWidget {
   final ValueChanged<int> onStartRepeat;
   final VoidCallback onStopRepeat;
   final double mouseSensitivity;
+  final VoidCallback onCompanionOpen;
 
   @override
   Widget build(BuildContext context) {
@@ -304,7 +319,7 @@ class _RemotePage extends StatelessWidget {
               child: switch (mode) {
                 0 => _DPad(onKey: onKey),
                 1 => _Touchpad(onKey: onKey),
-                _ => _MousePad(onKey: onKey, sensitivity: mouseSensitivity),
+                _ => _MousePad(onKey: onKey, sensitivity: mouseSensitivity, onCompanionOpen: onCompanionOpen),
               },
             ),
           ),
@@ -465,9 +480,10 @@ class _TouchpadState extends State<_Touchpad> {
 }
 
 class _MousePad extends StatefulWidget {
-  const _MousePad({required this.onKey, required this.sensitivity});
+  const _MousePad({required this.onKey, required this.sensitivity, required this.onCompanionOpen});
   final ValueChanged<int> onKey;
   final double sensitivity;
+  final VoidCallback onCompanionOpen;
   @override
   State<_MousePad> createState() => _MousePadState();
 }
@@ -491,14 +507,19 @@ class _MousePadState extends State<_MousePad> {
         }
       },
       child: _PadSurface(
-        child: const Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-          Icon(Icons.mouse_rounded, color: _cyan, size: 47),
-          SizedBox(height: 14),
-          Text('Мышь — эксперимент', style: TextStyle(color: _text, fontWeight: FontWeight.w900, fontSize: 15)),
-          SizedBox(height: 6),
-          Padding(
+        child: Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+          const Icon(Icons.mouse_rounded, color: _cyan, size: 47),
+          const SizedBox(height: 14),
+          const Text('Мышь — эксперимент', style: TextStyle(color: _text, fontWeight: FontWeight.w900, fontSize: 15)),
+          const SizedBox(height: 6),
+          const Padding(
             padding: EdgeInsets.symmetric(horizontal: 24),
-            child: Text('Пока движение преобразуется в навигацию X96. Настоящий системный курсор зависит от прошивки.', textAlign: TextAlign.center, style: TextStyle(color: _muted, fontSize: 11, height: 1.4)),
+            child: Text('Этот режим пока использует стрелки. Для настоящего курсора установи Pult-TV на приставку и открой расширенное управление.', textAlign: TextAlign.center, style: TextStyle(color: _muted, fontSize: 11, height: 1.4)),
+          ),
+          const SizedBox(height: 12),
+          FilledButton(
+            onPressed: widget.onCompanionOpen,
+            child: const Text('Настоящая мышь · Pult-TV'),
           ),
         ]),
       ),
@@ -522,8 +543,9 @@ class _PadSurface extends StatelessWidget {
 }
 
 class _AppsPage extends StatelessWidget {
-  const _AppsPage({required this.onLaunch});
+  const _AppsPage({required this.onLaunch, required this.onCompanionOpen});
   final ValueChanged<_AppTarget> onLaunch;
+  final VoidCallback onCompanionOpen;
 
   static const apps = <_AppTarget>[
     _AppTarget('YouTube', Icons.play_circle_fill_rounded, 'https://www.youtube.com/tv'),
@@ -541,6 +563,8 @@ class _AppsPage extends StatelessWidget {
       const Text('Приложения', style: TextStyle(color: _text, fontSize: 21, fontWeight: FontWeight.w900)),
       const SizedBox(height: 5),
       const Text('Нажатие отправляет X96 прямую ссылку. Если приложение зарегистрировало её, оно откроется поверх текущего.', style: TextStyle(color: _muted, fontSize: 11, height: 1.4)),
+      const SizedBox(height: 12),
+      FilledButton.icon(onPressed: onCompanionOpen, icon: const Icon(Icons.apps), label: const Text('Все приложения с приставки')) ,
       const SizedBox(height: 14),
       Expanded(
         child: GridView.builder(
@@ -584,8 +608,9 @@ class _AppTile extends StatelessWidget {
 }
 
 class _KeyboardPage extends StatefulWidget {
-  const _KeyboardPage({required this.onSend});
+  const _KeyboardPage({required this.onSend, required this.onCompanionOpen});
   final ValueChanged<String> onSend;
+  final VoidCallback onCompanionOpen;
   @override
   State<_KeyboardPage> createState() => _KeyboardPageState();
 }
@@ -601,6 +626,8 @@ class _KeyboardPageState extends State<_KeyboardPage> {
       const Text('Клавиатура', style: TextStyle(color: _text, fontSize: 21, fontWeight: FontWeight.w900)),
       const SizedBox(height: 6),
       const Text('Сначала поставь курсор в поле ввода на телевизоре, затем отправь текст.', style: TextStyle(color: _muted, fontSize: 11)),
+      const SizedBox(height: 12),
+      OutlinedButton.icon(onPressed: widget.onCompanionOpen, icon: const Icon(Icons.keyboard_alt_rounded), label: const Text('Ввод через компонент Pult-TV')),
       const SizedBox(height: 16),
       TextField(
         controller: c,
@@ -704,13 +731,15 @@ class _Macro extends StatelessWidget {
 }
 
 class _SettingsPage extends StatelessWidget {
-  const _SettingsPage({required this.haptics, required this.sensitivity, required this.onHaptics, required this.onSensitivity, required this.onReconnect});
-  final bool haptics; final double sensitivity; final ValueChanged<bool> onHaptics; final ValueChanged<double> onSensitivity; final VoidCallback onReconnect;
+  const _SettingsPage({required this.haptics, required this.sensitivity, required this.onHaptics, required this.onSensitivity, required this.onReconnect, required this.onCompanionOpen});
+  final bool haptics; final double sensitivity; final ValueChanged<bool> onHaptics; final ValueChanged<double> onSensitivity; final VoidCallback onReconnect; final VoidCallback onCompanionOpen;
   @override
   Widget build(BuildContext context) => ListView(
     padding: const EdgeInsets.fromLTRB(14, 14, 14, 16),
     children: [
       const Text('Настройки', style: TextStyle(color: _text, fontSize: 21, fontWeight: FontWeight.w900)),
+      const SizedBox(height: 12),
+      _SettingTile(icon: Icons.mouse_rounded, title: 'Расширенное управление · Pult-TV', subtitle: 'Мышь, приложения, клавиатура', onTap: onCompanionOpen),
       const SizedBox(height: 12),
       _SettingTile(icon: Icons.vibration_rounded, title: 'Виброотклик', trailing: Switch(value: haptics, onChanged: onHaptics)),
       const SizedBox(height: 9),
