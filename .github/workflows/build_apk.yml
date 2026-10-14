@@ -51,30 +51,17 @@ jobs:
             exit "$status"
           fi
 
-      - name: Upload build log
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: x96-build-log
-          path: build_apk.log
-          if-no-files-found: warn
-
-      - name: Upload APK artifact
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: x96-remote-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
-          if-no-files-found: error
-
-      - name: Attach phone APK to GitHub Releases
-        if: success()
+      # Upload directly to GitHub Releases. Actions artifact storage is not used.
+      - name: Publish phone APK to GitHub Releases
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp build/app/outputs/flutter-apk/app-release.apk Pult-Phone.apk
-          gh release create "pult-phone-test-${{ github.run_number }}" Pult-Phone.apk \
-            --title "Pult Phone · Test #${{ github.run_number }}" \
+          set -euo pipefail
+          source_apk="build/app/outputs/flutter-apk/app-release.apk"
+          test -s "$source_apk"
+          cp "$source_apk" Pult-Phone.apk
+          gh release create "pult-phone-test-${{ github.run_number }}-a${{ github.run_attempt }}" Pult-Phone.apk \
+            --title "Pult Phone · Test #${{ github.run_number }} (attempt ${{ github.run_attempt }})" \
             --notes 'Android phone remote. Use Pult-TV on the X96 for extended features.' \
             --target "${{ github.sha }}" --prerelease
