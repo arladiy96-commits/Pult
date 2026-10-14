@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -362,8 +361,13 @@ class _TvCompanionScreenState extends State<TvCompanionScreen> {
         if (input.text.isEmpty) return;
         try {
           final result = await client.request({'cmd': 'text', 'text': input.text});
-          if (result['ok'] == true) { input.clear(); }
-          else if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('${result['error']}')));
+          if (result['ok'] == true) {
+            input.clear();
+          } else if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('${result['error']}')),
+            );
+          }
         } catch (e) { if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e'))); }
       },
       icon: const Icon(Icons.send_rounded),
