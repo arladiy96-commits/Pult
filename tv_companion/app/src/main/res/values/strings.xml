@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Пульт · Приставка</string>
+    <string name="accessibility_description">Разрешает управление курсором, нажатиями и прокруткой с сопряжённого телефона по локальной сети. Включайте только на своей приставке.</string>
+</resources>
