@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../services/tv_companion_client.dart';
 
@@ -12,8 +14,8 @@ const _line = Color(0xFF215370);
 const _cyan = Color(0xFF29C7FF);
 const _muted = Color(0xFF8EA7BA);
 
-/// The original Android TV remote remains unchanged. This is an optional
-/// separate screen to exercise TV-side mouse/IME/application features.
+/// Full-screen touch area. Switching pages is only possible using controls,
+/// never by a horizontal swipe. The original TV Remote screen is unaffected.
 class TvCompanionScreen extends StatefulWidget {
   const TvCompanionScreen({super.key, required this.host});
   final String host;
@@ -22,49 +24,144 @@ class TvCompanionScreen extends StatefulWidget {
   State<TvCompanionScreen> createState() => _TvCompanionScreenState();
 }
 
-class _TvCompanionScreenState extends State<TvCompanionScreen> {
+enum _Panel { mouse, apps, keyboard, settings }
+
+class _TvCompanionScreenState extends State<TvCompanionScreen>
+    with WidgetsBindingObserver {
   late final TvCompanionClient client = TvCompanionClient(widget.host);
+  final _vault = const FlutterSecureStorage();
   final pin = TextEditingController();
   final input = TextEditingController();
   final apps = <_TvApp>[];
+  final _touches = <int, Offset>{};
+  StreamSubscription<bool>? _connectionSubscription;
+  Timer? _heartbeat;
+  Timer? _retry;
+  Timer? _dragArm;
+  Timer? _moveTick;
+  Future<void>? _movementPending;
+
+  _Panel panel = _Panel.mouse;
   String? pendingFingerprint;
-  String status = 'Поиск установленного компонента…';
+  String status = 'Поиск компонента на приставке…';
   bool confirmed = false;
   bool busy = false;
+  bool paired = false;
   bool connected = false;
+  bool connecting = false;
   bool loadingApps = false;
+  bool _appActive = true;
+  bool _multiTouch = false;
+  bool _touchMoved = false;
+  bool _dragActive = false;
+  bool _dragClosing = false;
+  bool _accelerate = true;
+  bool _haptics = false;
+  int _retries = 0;
   double sensitivity = 1.7;
-  double accumX = 0, accumY = 0, accumScroll = 0;
-  DateTime lastPointerSent = DateTime.fromMillisecondsSinceEpoch(0);
+  double _accumX = 0, _accumY = 0;
+  double _accumScroll = 0;
+  double _scrollQueue = 0;
+  Offset? _touchStart;
+  DateTime? _touchDownTime;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _connectionSubscription = client.connectionChanges.listen((up) {
+      if (!mounted) return;
+      setState(() => connected = up);
+      if (!up && paired && _appActive && !connecting) _scheduleRetry();
+    });
+    _heartbeat = Timer.periodic(const Duration(seconds: 22), (_) {
+      if (_appActive && paired && !connecting) unawaited(_checkLink());
+    });
+    _moveTick = Timer.periodic(const Duration(milliseconds: 16), (_) => _flushMove());
+    unawaited(_loadSettings());
     unawaited(_restore());
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    _appActive = state == AppLifecycleState.resumed;
+    if (_appActive) {
+      _updateImmersive();
+      if (paired) unawaited(_checkLink());
+    } else {
+      _retry?.cancel();
+      _dragArm?.cancel();
+      _touches.clear();
+      _accumX = _accumY = 0;
+      if (_dragActive) unawaited(_endDrag());
+      // Do not close TLS here: a backgrounded phone must not lose pairing.
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _retry?.cancel();
+    _dragArm?.cancel();
+    _heartbeat?.cancel();
+    _moveTick?.cancel();
+    _connectionSubscription?.cancel();
     pin.dispose();
     input.dispose();
-    client.close();
+    client.dispose();
+    unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
     super.dispose();
+  }
+
+  String get _pref => 'pult_tv_${widget.host}_';
+
+  Future<void> _loadSettings() async {
+    try {
+      final speed = double.tryParse(await _vault.read(key: '${_pref}speed') ?? '');
+      final acceleration = await _vault.read(key: '${_pref}accel');
+      final haptics = await _vault.read(key: '${_pref}haptics');
+      if (!mounted) return;
+      setState(() {
+        if (speed != null) sensitivity = speed.clamp(.6, 4.0).toDouble();
+        if (acceleration != null) _accelerate = acceleration == 'true';
+        if (haptics != null) _haptics = haptics == 'true';
+      });
+    } catch (_) { /* Defaults are safe when secure storage is unavailable. */ }
+  }
+
+  void _updateImmersive() {
+    if (!_appActive) return;
+    unawaited(SystemChrome.setEnabledSystemUIMode(
+      paired && panel == _Panel.mouse
+          ? SystemUiMode.immersiveSticky
+          : SystemUiMode.edgeToEdge,
+    ));
+  }
+
+  void _showPanel(_Panel next) {
+    _dragArm?.cancel();
+    _touches.clear();
+    if (_dragActive) unawaited(_endDrag());
+    setState(() => panel = next);
+    _updateImmersive();
+    if (next == _Panel.apps && apps.isEmpty) unawaited(_loadApps());
   }
 
   Future<void> _restore() async {
     setState(() { busy = true; status = 'Подключение к ${widget.host}…'; });
     try {
       final identity = await client.storedIdentity();
-      if (identity != null) {
-        await client.connectSaved();
-        if (!mounted) return;
-        setState(() { connected = true; status = 'Защищённое соединение с приставкой'; });
-      } else {
+      if (!mounted) return;
+      if (identity == null) {
         await _probe();
+      } else {
+        setState(() => paired = true);
+        _updateImmersive();
+        await _checkLink();
       }
     } catch (e) {
-      if (!mounted) return;
-      setState(() { connected = false; status = 'Нет подключения: $e'; });
+      if (mounted) setState(() => status = 'Нет соединения: $e');
+      if (paired) _scheduleRetry();
     } finally {
       if (mounted) setState(() => busy = false);
     }
@@ -76,18 +173,24 @@ class _TvCompanionScreenState extends State<TvCompanionScreen> {
     setState(() {
       pendingFingerprint = fingerprint;
       confirmed = false;
-      status = 'Сравни отпечаток ниже с экраном приставки';
+      status = 'Сравни SHA-256 с экраном приставки';
     });
   }
 
   Future<void> _pair() async {
-    if (!confirmed || pendingFingerprint == null) return;
+    if (!confirmed || pendingFingerprint == null || busy) return;
     setState(() { busy = true; status = 'Сопряжение…'; });
     try {
       await client.pair(pendingFingerprint!, pin.text.trim());
       if (!mounted) return;
-      setState(() { connected = true; status = 'Подключено и сохранено'; });
       pin.clear();
+      setState(() {
+        paired = true;
+        connected = true;
+        panel = _Panel.mouse;
+        status = 'Подключено';
+      });
+      _updateImmersive();
     } catch (e) {
       if (mounted) setState(() => status = 'Не удалось сопрячь: $e');
     } finally {
@@ -96,70 +199,216 @@ class _TvCompanionScreenState extends State<TvCompanionScreen> {
   }
 
   Future<void> _forget() async {
+    _retry?.cancel();
     await client.forget();
     if (!mounted) return;
-    setState(() { connected = false; pendingFingerprint = null; confirmed = false; apps.clear(); });
+    setState(() {
+      paired = false;
+      connected = false;
+      pendingFingerprint = null;
+      confirmed = false;
+      apps.clear();
+    });
+    _updateImmersive();
+    try { await _probe(); }
+    catch (e) { if (mounted) setState(() => status = 'Нет связи: $e'); }
+  }
+
+  Future<void> _checkLink() async {
+    if (connecting || !paired || !_appActive) return;
+    connecting = true;
     try {
-      await _probe();
+      await client.ensureConnected();
+      _retries = 0;
+      _retry?.cancel();
+      if (mounted) setState(() { connected = true; status = 'Подключено'; });
     } catch (e) {
-      if (mounted) setState(() => status = 'Нет связи: $e');
+      if (mounted) setState(() { connected = false; status = 'Восстанавливаем связь: $e'; });
+    } finally {
+      connecting = false;
+      if (!connected && paired && _appActive) _scheduleRetry();
     }
   }
 
-  Future<void> _command(String cmd, [Map<String, dynamic> extras = const {}]) async {
+  void _scheduleRetry() {
+    if (_retry?.isActive == true || !_appActive || !paired) return;
+    final delay = [2, 3, 5, 8, 13, 20][_retries.clamp(0, 5).toInt()];
+    _retries = (_retries + 1).clamp(0, 5).toInt();
+    _retry = Timer(Duration(seconds: delay), () => unawaited(_checkLink()));
+  }
+
+  Future<Map<String, dynamic>?> _send(Map<String, dynamic> cmd,
+      {bool silent = false}) async {
+    if (!client.isConnected) {
+      if (!connecting && paired) unawaited(_checkLink());
+      return null;
+    }
     try {
-      final response = await client.request({'cmd': cmd, ...extras});
-      if (response['ok'] != true) {
-        throw StateError('${response['error'] ?? 'Команда отклонена'}');
+      final result = await client.request(cmd);
+      if (result['ok'] != true) throw StateError('${result['error'] ?? 'Команда отклонена'}');
+      return result;
+    } catch (e) {
+      if (mounted && !silent) {
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(SnackBar(content: Text('$e'), duration: const Duration(seconds: 2)));
       }
-    } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('$e'), backgroundColor: _panel),
-      );
+      if (!client.isConnected && paired) unawaited(_checkLink());
+      return null;
     }
   }
 
-  void _move(DragUpdateDetails d) {
-    accumX += d.delta.dx * sensitivity;
-    accumY += d.delta.dy * sensitivity;
-    if (DateTime.now().difference(lastPointerSent).inMilliseconds < 30) return;
-    _flushMove();
+  void _command(String cmd, [Map<String, dynamic> extras = const {}]) {
+    if (_haptics) unawaited(HapticFeedback.selectionClick());
+    unawaited(_send({'cmd': cmd, ...extras}));
+  }
+
+  // Raw pointer tracking avoids conflicts between pan and page swipe recognizers.
+  void _pointerDown(PointerDownEvent e) {
+    if (!connected) return;
+    _touches[e.pointer] = e.position;
+    if (_touches.length == 1) {
+      _touchStart = e.position;
+      _touchDownTime = DateTime.now();
+      _touchMoved = false;
+      _multiTouch = false;
+      _dragArm?.cancel();
+      _dragArm = Timer(const Duration(milliseconds: 520), () {
+        if (_touches.length == 1 && !_multiTouch && !_touchMoved && connected) {
+          _dragActive = true;
+          _command('drag_start');
+        }
+      });
+    } else {
+      _multiTouch = true;
+      _dragArm?.cancel();
+      if (_dragActive) unawaited(_endDrag());
+    }
+  }
+
+  void _pointerMove(PointerMoveEvent e) {
+    final last = _touches[e.pointer];
+    if (last == null) return;
+    _touches[e.pointer] = e.position;
+    final delta = e.position - last;
+    if (_multiTouch || _touches.length >= 2) {
+      _multiTouch = true;
+      _dragArm?.cancel();
+      _trackScroll(delta.dy / math.max(1, _touches.length));
+      return;
+    }
+    if (!_touchMoved && _touchStart != null &&
+        (e.position - _touchStart!).distance > 9) {
+      _touchMoved = true;
+      _dragArm?.cancel();
+    }
+    // A tap may jitter a few pixels: never move the cursor before the
+    // movement threshold has been crossed.
+    if (!_touchMoved && !_dragActive) return;
+    final magnitude = delta.distance;
+    final acceleration = _accelerate ? (1 + (magnitude / 16).clamp(0.0, 0.7)) : 1.0;
+    _accumX += delta.dx * sensitivity * acceleration;
+    _accumY += delta.dy * sensitivity * acceleration;
+  }
+
+  void _pointerUp(PointerEvent e) {
+    if (_touches.remove(e.pointer) == null) return;
+    _dragArm?.cancel();
+    if (_dragActive) {
+      unawaited(_endDrag());
+    } else if (!_multiTouch && !_touchMoved && _touches.isEmpty &&
+        _touchDownTime != null &&
+        DateTime.now().difference(_touchDownTime!).inMilliseconds < 490) {
+      // Two quick taps send two actual tap gestures, without delaying the first.
+      _command('tap');
+    }
+    if (_touches.isEmpty) {
+      _multiTouch = false;
+      _touchStart = null;
+      _touchDownTime = null;
+      _flushMove();
+    }
   }
 
   void _flushMove() {
-    if (accumX == 0 && accumY == 0) return;
-    final dx = accumX, dy = accumY;
-    accumX = accumY = 0;
-    lastPointerSent = DateTime.now();
-    // Mouse movements are best-effort, but a session stays authenticated.
-    unawaited(client.request({'cmd': 'move', 'dx': dx, 'dy': dy}).catchError((Object _) => <String, dynamic>{}));
+    if (!connected || _dragClosing || _movementPending != null ||
+        (_accumX.abs() < .25 && _accumY.abs() < .25)) return;
+    // One movement in flight, accumulated deltas. No unbounded queue of stale
+    // cursor positions. Android clamps each move to 250px on the TV.
+    final dx = _accumX.clamp(-200.0, 200.0).toDouble();
+    final dy = _accumY.clamp(-200.0, 200.0).toDouble();
+    _accumX -= dx;
+    _accumY -= dy;
+    final isDrag = _dragActive;
+    final pending = _send({'cmd': isDrag ? 'drag_move' : 'move', 'dx': dx, 'dy': dy}, silent: true)
+        .then<void>((_) {});
+    _movementPending = pending;
+    unawaited(pending.whenComplete(() {
+      if (identical(_movementPending, pending)) _movementPending = null;
+    }));
   }
 
-  void _scroll(DragUpdateDetails d) {
-    accumScroll += d.delta.dy;
-    if (accumScroll.abs() < 24) return;
-    final direction = accumScroll < 0 ? 1 : -1;
-    accumScroll = 0;
-    unawaited(client.request({'cmd': 'scroll', 'dy': direction}).catchError((Object _) => <String, dynamic>{}));
+  Future<void> _endDrag() async {
+    if (!_dragActive || _dragClosing) return;
+    _dragClosing = true;
+    _dragActive = false;
+    try {
+      final prior = _movementPending;
+      if (prior != null) await prior;
+      // Finish all accumulated drag movement before releasing the long press.
+      while (client.isConnected &&
+          (_accumX.abs() > .2 || _accumY.abs() > .2)) {
+        final dx = _accumX.clamp(-200.0, 200.0).toDouble();
+        final dy = _accumY.clamp(-200.0, 200.0).toDouble();
+        _accumX -= dx;
+        _accumY -= dy;
+        await _send({'cmd': 'drag_move', 'dx': dx, 'dy': dy}, silent: true);
+      }
+      await _send({'cmd': 'drag_end'}, silent: true);
+    } finally {
+      _dragClosing = false;
+    }
+  }
+
+  void _trackScroll(double dy) {
+    _accumScroll += dy;
+    if (_accumScroll.abs() < 18) return;
+    final steps = (_accumScroll.abs() / 35).clamp(1.0, 4.0);
+    _scrollQueue += _accumScroll < 0 ? steps : -steps;
+    _accumScroll = 0;
+    _drainScroll();
+  }
+
+  bool _scrollSending = false;
+  Future<void> _drainScroll() async {
+    if (_scrollSending || !connected || _scrollQueue.abs() < .2) return;
+    _scrollSending = true;
+    try {
+      while (mounted && connected && _scrollQueue.abs() >= .2) {
+        final value = _scrollQueue.clamp(-4.0, 4.0).toDouble();
+        _scrollQueue -= value;
+        await _send({'cmd': 'scroll', 'dy': value}, silent: true);
+      }
+    } finally {
+      _scrollSending = false;
+    }
   }
 
   Future<void> _loadApps() async {
     if (loadingApps) return;
     setState(() => loadingApps = true);
     try {
-      final answer = await client.request({'cmd': 'apps'});
-      if (answer['ok'] != true) throw StateError('${answer['error'] ?? 'Ошибка списка'}');
+      if (!client.isConnected) await _checkLink();
+      if (!client.isConnected) return;
+      final answer = await _send({'cmd': 'apps'});
+      if (answer == null || !mounted) return;
       final entries = (answer['apps'] as List<dynamic>?) ?? [];
-      if (!mounted) return;
       setState(() {
         apps
           ..clear()
           ..addAll(entries.whereType<Map<String, dynamic>>().map(_TvApp.fromJson));
         apps.sort((a, b) => a.name.toLowerCase().compareTo(b.name.toLowerCase()));
       });
-    } catch (e) {
-      if (mounted) setState(() => status = 'Ошибка загрузки приложений: $e');
     } finally {
       if (mounted) setState(() => loadingApps = false);
     }
@@ -167,225 +416,296 @@ class _TvCompanionScreenState extends State<TvCompanionScreen> {
 
   @override
   Widget build(BuildContext context) {
-    return DefaultTabController(
-      length: 3,
-      child: Scaffold(
+    if (paired && panel == _Panel.mouse) {
+      return Scaffold(backgroundColor: _bg, body: _fullscreenMouse());
+    }
+    return Scaffold(
+      backgroundColor: _bg,
+      appBar: AppBar(
         backgroundColor: _bg,
-        appBar: AppBar(
-          backgroundColor: _bg,
-          foregroundColor: Colors.white,
-          title: const Text('Пульт · Расширенное'),
-          actions: [
-            if (connected) IconButton(
-              tooltip: 'Забыть сопряжение',
-              icon: const Icon(Icons.link_off_rounded),
-              onPressed: _forget,
-            ),
-          ],
-          bottom: connected ? const TabBar(
-            indicatorColor: _cyan,
-            labelColor: _cyan,
-            unselectedLabelColor: _muted,
-            tabs: [Tab(text: 'Мышь'), Tab(text: 'Приложения'), Tab(text: 'Клавиатура')],
-          ) : null,
-        ),
-        body: Column(children: [
-          Padding(
-            padding: const EdgeInsets.all(12),
-            child: _tile(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text('X96 · ${widget.host}:39678', style: const TextStyle(color: _cyan, fontWeight: FontWeight.bold)),
-              const SizedBox(height: 6),
-              Text(status, style: const TextStyle(color: _muted, fontSize: 12)),
-            ])),
+        foregroundColor: Colors.white,
+        title: Text(!paired ? 'Пульт · Подключение' :
+          panel == _Panel.apps ? 'Приложения X96' :
+          panel == _Panel.keyboard ? 'Клавиатура X96' : 'Настройки мыши'),
+        actions: [
+          if (paired) IconButton(
+            tooltip: 'Полноэкранная мышь',
+            icon: const Icon(Icons.mouse_rounded, color: _cyan),
+            onPressed: () => _showPanel(_Panel.mouse),
           ),
-          if (busy) const LinearProgressIndicator(minHeight: 2, color: _cyan),
-          Expanded(child: connected ? TabBarView(children: [
-            _mousePage(),
-            _appsPage(),
-            _keyboardPage(),
-          ]) : _pairPage()),
-        ]),
+        ],
       ),
+      body: Column(children: [
+        Padding(
+          padding: const EdgeInsets.all(12),
+          child: _tile(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('X96 · ${widget.host}:39678',
+                style: const TextStyle(color: _cyan, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 6),
+            Text(status, style: const TextStyle(color: _muted, fontSize: 12)),
+          ])),
+        ),
+        if (busy) const LinearProgressIndicator(minHeight: 2, color: _cyan),
+        Expanded(child: !paired ? _pairPage() : switch (panel) {
+          _Panel.apps => _appsPage(),
+          _Panel.keyboard => _keyboardPage(),
+          _Panel.settings => _settingsPage(),
+          _Panel.mouse => const SizedBox.shrink(),
+        }),
+      ]),
     );
   }
 
-  Widget _pairPage() {
-    return ListView(padding: const EdgeInsets.all(15), children: [
-      const Text('Подключение компонента на приставке', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 19)),
-      const SizedBox(height: 9),
-      const Text('Установи Pult-TV.apk на X96, включи службу специальных возможностей и нажми на приставке «Показать код на 2 минуты». Телефон и X96 должны быть в одной сети.', style: TextStyle(color: _muted, height: 1.4)),
-      const SizedBox(height: 15),
-      if (pendingFingerprint != null) ...[
-        const Text('Отпечаток сертификата SHA-256:', style: TextStyle(color: Colors.white)),
-        const SizedBox(height: 9),
-        SelectableText(pendingFingerprint!.replaceAllMapped(RegExp(r'.{2}'), (m) => '${m.group(0)}:' ).replaceFirst(RegExp(r':$'), ''),
-            style: const TextStyle(color: _cyan, fontSize: 13)),
-        const SizedBox(height: 12),
-        CheckboxListTile(
-          contentPadding: EdgeInsets.zero,
-          title: const Text('Отпечаток полностью совпадает с тем, что показан на телевизоре', style: TextStyle(color: Colors.white, fontSize: 13)),
-          value: confirmed,
-          onChanged: (v) => setState(() => confirmed = v ?? false),
-          activeColor: _cyan,
-          controlAffinity: ListTileControlAffinity.leading,
+  Widget _fullscreenMouse() => Stack(children: [
+    Positioned.fill(child: Listener(
+      behavior: HitTestBehavior.opaque,
+      onPointerDown: _pointerDown,
+      onPointerMove: _pointerMove,
+      onPointerUp: _pointerUp,
+      onPointerCancel: _pointerUp,
+      child: const SizedBox.expand(),
+    )),
+    // Instructions are not a separate panel and don't intercept touch input.
+    const Positioned.fill(child: IgnorePointer(child: Center(
+      child: Opacity(opacity: .18, child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.mouse_rounded, size: 48, color: _cyan),
+          SizedBox(height: 8),
+          Text('ТАЧПАД', style: TextStyle(color: Colors.white,
+              letterSpacing: 3, fontWeight: FontWeight.bold)),
+          Text('1 палец · курсор       2 пальца · прокрутка',
+              style: TextStyle(color: _muted, fontSize: 11)),
+        ],
+      )),
+    ))),
+    Positioned(top: 16, left: 15, right: 15,
+      child: Row(children: [
+        _mouseButton(Icons.chevron_left_rounded, 'Обычный пульт', () {
+          unawaited(SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge));
+          Navigator.maybePop(context);
+        }),
+        const SizedBox(width: 7),
+        Expanded(child: Center(child: GestureDetector(
+          onTap: () => unawaited(_checkLink()),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 13, vertical: 10),
+            decoration: BoxDecoration(
+              color: _panel.withValues(alpha: .85),
+              borderRadius: BorderRadius.circular(30),
+              border: Border.all(color: connected ? _line : Colors.orangeAccent),
+            ),
+            child: Row(mainAxisSize: MainAxisSize.min, children: [
+              Icon(connected ? Icons.wifi_rounded : Icons.wifi_off_rounded,
+                  size: 14, color: connected ? _cyan : Colors.orangeAccent),
+              const SizedBox(width: 6),
+              Flexible(child: Text(connected ? 'X96 · подключено' : 'Переподключение…',
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: Colors.white, fontSize: 11))),
+            ]),
+          ),
+        ))),
+        _mouseButton(Icons.apps_rounded, 'Приложения', () => _showPanel(_Panel.apps)),
+        const SizedBox(width: 6),
+        _mouseButton(Icons.keyboard_rounded, 'Клавиатура', () => _showPanel(_Panel.keyboard)),
+        const SizedBox(width: 6),
+        _mouseButton(Icons.tune_rounded, 'Настройки', () => _showPanel(_Panel.settings)),
+      ]),
+    ),
+    // An optional dedicated vertical scroll strip; the rest remains touchpad.
+    Positioned(right: 5, top: 95, bottom: 92, width: 31,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onVerticalDragUpdate: (d) => _trackScroll(d.delta.dy),
+        child: Align(alignment: Alignment.centerRight,
+          child: Container(height: 125, width: 26,
+            decoration: BoxDecoration(color: _panel.withValues(alpha: .78),
+              borderRadius: BorderRadius.circular(20), border: Border.all(color: _line)),
+            child: const Column(mainAxisAlignment: MainAxisAlignment.spaceEvenly, children: [
+              Icon(Icons.keyboard_arrow_up_rounded, size: 18, color: _cyan),
+              Icon(Icons.swap_vert_rounded, size: 15, color: _muted),
+              Icon(Icons.keyboard_arrow_down_rounded, size: 18, color: _cyan),
+            ]),
+          ),
         ),
-        TextField(
-          controller: pin,
-          style: const TextStyle(color: Colors.white, fontSize: 20),
-          keyboardType: TextInputType.number,
-          maxLength: 6,
-          inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-          decoration: const InputDecoration(labelText: 'Код с экрана X96', labelStyle: TextStyle(color: _muted)),
-        ),
-        const SizedBox(height: 6),
-        FilledButton(onPressed: busy || !confirmed ? null : _pair, child: const Text('Сопрячь и сохранить')),
-      ],
-      const SizedBox(height: 10),
-      OutlinedButton(onPressed: busy ? null : () async {
-        setState(() => busy = true);
-        try {
-          final saved = await client.storedIdentity();
-          if (saved != null) { await client.connectSaved(); if (mounted) setState(() { connected = true; status = 'Подключено'; }); }
-          else { await _probe(); }
-        } catch (e) { if (mounted) setState(() => status = '$e'); }
-        finally { if (mounted) setState(() => busy = false); }
-      }, child: const Text('Проверить соединение ещё раз')),
-      OutlinedButton(onPressed: busy ? null : _forget, child: const Text('Сбросить старое сопряжение')),
-    ]);
-  }
+      ),
+    ),
+    Positioned(left: 12, right: 12, bottom: 10,
+      child: Row(children: [
+        Expanded(child: _mouseWide(Icons.arrow_back_rounded, 'Назад', () => _command('key', {'code': 4}))),
+        const SizedBox(width: 8),
+        Expanded(child: _mouseWide(Icons.home_rounded, 'Домой', () => _command('key', {'code': 3}))),
+        const SizedBox(width: 8),
+        Expanded(child: _mouseWide(Icons.ads_click_rounded, 'Клик', () => _command('tap'))),
+        const SizedBox(width: 8),
+        _mouseButton(Icons.visibility_off_rounded, 'Скрыть курсор', () => _command('hide_cursor')),
+      ]),
+    ),
+  ]);
 
-  Widget _mousePage() => Padding(
-    padding: const EdgeInsets.all(12),
-    child: Column(children: [
-      const Text('Двигай пальцем — курсор на телевизоре. Нажатие — клик, удержание — длинный клик.',
-          style: TextStyle(color: _muted, fontSize: 12)),
+  Widget _mouseButton(IconData icon, String tooltip, VoidCallback action) =>
+      IconButton.filledTonal(
+        tooltip: tooltip,
+        onPressed: action,
+        style: IconButton.styleFrom(backgroundColor: _panel.withValues(alpha: .9),
+          foregroundColor: _cyan,
+          side: const BorderSide(color: _line),
+          minimumSize: const Size(43, 43)),
+        icon: Icon(icon, size: 21),
+      );
+
+  Widget _mouseWide(IconData icon, String name, VoidCallback action) =>
+      SizedBox(height: 48, child: OutlinedButton.icon(
+        onPressed: action,
+        style: OutlinedButton.styleFrom(
+          backgroundColor: _panel.withValues(alpha: .9),
+          foregroundColor: Colors.white,
+          side: const BorderSide(color: _line),
+          padding: const EdgeInsets.symmetric(horizontal: 6),
+        ),
+        icon: Icon(icon, size: 18),
+        label: Text(name, style: const TextStyle(fontSize: 11)),
+      ));
+
+  Widget _pairPage() => ListView(padding: const EdgeInsets.all(15), children: [
+    const Text('Подключение компонента на приставке',
+      style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 19)),
+    const SizedBox(height: 9),
+    const Text('Установи Pult-TV.apk на X96, включи службу управления и нажми на телевизоре «Показать код на 2 минуты».',
+      style: TextStyle(color: _muted, height: 1.4)),
+    const SizedBox(height: 15),
+    if (pendingFingerprint != null) ...[
+      const Text('Отпечаток SHA-256:', style: TextStyle(color: Colors.white)),
+      const SizedBox(height: 9),
+      SelectableText(pendingFingerprint!.replaceAllMapped(RegExp(r'.{2}'), (m) => '${m.group(0)}:')
+          .replaceFirst(RegExp(r':$'), ''),
+          style: const TextStyle(color: _cyan, fontSize: 13)),
       const SizedBox(height: 12),
-      Expanded(child: Row(children: [
-        Expanded(child: GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onPanUpdate: _move,
-          onPanEnd: (_) => _flushMove(),
-          onTap: () => _command('tap'),
-          onLongPress: () => _command('long_press'),
-          child: _tile(const Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
-            Icon(Icons.mouse_rounded, size: 56, color: _cyan),
-            SizedBox(height: 15),
-            Text('ТАЧПАД', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-            SizedBox(height: 7),
-            Text('Движение · Клик', style: TextStyle(color: _muted)),
-          ]))),
-        )),
-        const SizedBox(width: 10),
-        SizedBox(width: 65, child: GestureDetector(
-          behavior: HitTestBehavior.opaque,
-          onVerticalDragUpdate: _scroll,
-          child: _tile(const Center(child: Column(mainAxisSize: MainAxisSize.min, children: [
-            Icon(Icons.keyboard_arrow_up, color: _cyan),
-            SizedBox(height: 12),
-            Icon(Icons.swap_vert_rounded, color: Colors.white),
-            SizedBox(height: 9),
-            Text('СКРОЛЛ', style: TextStyle(color: _muted, fontSize: 9)),
-            SizedBox(height: 12),
-            Icon(Icons.keyboard_arrow_down, color: _cyan),
-          ]))),
-        )),
-      ])),
-      Row(children: [
-        const Text('Чувствительность', style: TextStyle(color: _muted, fontSize: 11)),
-        Expanded(child: Slider(
-          value: sensitivity, min: .6, max: 3.5,
-          onChanged: (v) => setState(() => sensitivity = v),
-          activeColor: _cyan,
-        )),
-      ]),
-      Row(children: [
-        Expanded(child: OutlinedButton(onPressed: () => _command('key', {'code': 4}), child: const Text('Назад'))),
-        const SizedBox(width: 8),
-        Expanded(child: OutlinedButton(onPressed: () => _command('key', {'code': 3}), child: const Text('Домой'))),
-        const SizedBox(width: 8),
-        Expanded(child: OutlinedButton(onPressed: () => _command('hide_cursor'), child: const Text('Скрыть'))),
-      ]),
-    ]),
-  );
+      CheckboxListTile(
+        contentPadding: EdgeInsets.zero,
+        title: const Text('Отпечаток полностью совпадает с экраном телевизора',
+          style: TextStyle(color: Colors.white, fontSize: 13)),
+        value: confirmed,
+        onChanged: (v) => setState(() => confirmed = v ?? false),
+        activeColor: _cyan,
+        controlAffinity: ListTileControlAffinity.leading,
+      ),
+      TextField(controller: pin,
+        style: const TextStyle(color: Colors.white, fontSize: 20),
+        keyboardType: TextInputType.number, maxLength: 6,
+        inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+        decoration: const InputDecoration(labelText: 'Код с экрана X96',
+          labelStyle: TextStyle(color: _muted))),
+      const SizedBox(height: 6),
+      FilledButton(onPressed: busy || !confirmed ? null : _pair,
+        child: const Text('Сопрячь и сохранить')),
+    ],
+    const SizedBox(height: 10),
+    OutlinedButton(onPressed: busy ? null : () async {
+      setState(() => busy = true);
+      try { await _probe(); }
+      catch (e) { if (mounted) setState(() => status = '$e'); }
+      finally { if (mounted) setState(() => busy = false); }
+    }, child: const Text('Проверить соединение ещё раз')),
+    OutlinedButton(onPressed: busy ? null : _forget,
+        child: const Text('Сбросить старое сопряжение')),
+  ]);
 
   Widget _appsPage() => Column(children: [
-    Padding(padding: const EdgeInsets.symmetric(horizontal: 12), child:
-      Row(children: [
-        Expanded(child: Text('Установлено: ${apps.length}', style: const TextStyle(color: _muted))),
-        TextButton.icon(onPressed: _loadApps, icon: const Icon(Icons.refresh), label: const Text('Обновить')),
+    Padding(padding: const EdgeInsets.symmetric(horizontal: 12),
+      child: Row(children: [
+        Expanded(child: Text('Установлено: ${apps.length}',
+          style: const TextStyle(color: _muted))),
+        TextButton.icon(onPressed: _loadApps,
+          icon: const Icon(Icons.refresh), label: const Text('Обновить')),
       ])),
     if (loadingApps) const LinearProgressIndicator(minHeight: 2, color: _cyan),
     Expanded(child: apps.isEmpty
-      ? Center(child: FilledButton.icon(
-          onPressed: _loadApps,
+      ? Center(child: FilledButton.icon(onPressed: _loadApps,
           icon: const Icon(Icons.grid_view_rounded),
-          label: const Text('Загрузить приложения с X96'),
-        ))
+          label: const Text('Загрузить приложения с X96')))
       : GridView.builder(
-          padding: const EdgeInsets.all(12),
-          itemCount: apps.length,
-          gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(crossAxisCount: 3, mainAxisSpacing: 9, crossAxisSpacing: 9, childAspectRatio: .82),
-          itemBuilder: (_, i) {
-            final a = apps[i];
-            return InkWell(
-              onTap: () => _command('launch', {'package': a.packageName}),
-              child: _tile(Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-                if (a.icon != null) Image.memory(a.icon!, width: 48, height: 48, errorBuilder: (_, _, _) => const Icon(Icons.apps_rounded, color: _cyan, size: 42))
-                else const Icon(Icons.apps_rounded, color: _cyan, size: 42),
-                const SizedBox(height: 10),
-                Text(a.name, maxLines: 2, overflow: TextOverflow.ellipsis, textAlign: TextAlign.center,
-                  style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12)),
-              ])),
-            );
-          },
-        )),
+        padding: const EdgeInsets.all(12), itemCount: apps.length,
+        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: 3, mainAxisSpacing: 9, crossAxisSpacing: 9, childAspectRatio: .82),
+        itemBuilder: (_, i) {
+          final a = apps[i];
+          return InkWell(onTap: () => _command('launch', {'package': a.packageName}),
+            child: _tile(Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+              if (a.icon != null) Image.memory(a.icon!, width: 48, height: 48,
+                errorBuilder: (_, _, _) => const Icon(Icons.apps_rounded, color: _cyan, size: 42))
+              else const Icon(Icons.apps_rounded, color: _cyan, size: 42),
+              const SizedBox(height: 10),
+              Text(a.name, maxLines: 2, overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold,
+                  fontSize: 12)),
+            ])),
+          );
+        },
+      )),
   ]);
 
   Widget _keyboardPage() => ListView(padding: const EdgeInsets.all(15), children: [
-    const Text('Сначала открой поле ввода на приставке и выбери системную клавиатуру «Пульт · ввод с телефона».',
-      style: TextStyle(color: _muted, height: 1.5)),
+    const Text('Открой поле ввода на приставке. Для всех полей выбери системную клавиатуру «Пульт · ввод с телефона».',
+        style: TextStyle(color: _muted, height: 1.5)),
     const SizedBox(height: 15),
-    TextField(
-      controller: input,
-      minLines: 2,
-      maxLines: 5,
+    TextField(controller: input, minLines: 2, maxLines: 5,
       style: const TextStyle(color: Colors.white),
-      decoration: const InputDecoration(
-        labelText: 'Текст для телевизора', labelStyle: TextStyle(color: _muted),
-        border: OutlineInputBorder(),
-      ),
-    ),
+      decoration: const InputDecoration(labelText: 'Текст для телевизора',
+        labelStyle: TextStyle(color: _muted), border: OutlineInputBorder())),
     const SizedBox(height: 10),
-    FilledButton.icon(
-      onPressed: () async {
-        if (input.text.isEmpty) return;
-        try {
-          final result = await client.request({'cmd': 'text', 'text': input.text});
-          if (result['ok'] == true) {
-            input.clear();
-          } else if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text('${result['error']}')),
-            );
-          }
-        } catch (e) { if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e'))); }
-      },
-      icon: const Icon(Icons.send_rounded),
-      label: const Text('Отправить текст'),
-    ),
+    FilledButton.icon(onPressed: () async {
+      if (input.text.isEmpty) return;
+      final result = await _send({'cmd': 'text', 'text': input.text});
+      if (result != null && mounted) input.clear();
+    }, icon: const Icon(Icons.send_rounded), label: const Text('Отправить текст')),
     const SizedBox(height: 10),
-    OutlinedButton.icon(onPressed: () => _command('delete'), icon: const Icon(Icons.backspace_outlined),
-        label: const Text('Удалить символ на приставке')),
+    OutlinedButton.icon(onPressed: () => _command('delete'),
+      icon: const Icon(Icons.backspace_outlined),
+      label: const Text('Удалить символ на приставке')),
+  ]);
+
+  Widget _settingsPage() => ListView(padding: const EdgeInsets.all(16), children: [
+    const Text('Настройки курсора',
+      style: TextStyle(fontSize: 20, color: Colors.white, fontWeight: FontWeight.bold)),
+    const SizedBox(height: 12),
+    Text('Чувствительность · ${sensitivity.toStringAsFixed(1)}',
+      style: const TextStyle(color: _muted)),
+    Slider(value: sensitivity, min: .6, max: 4.0,
+      activeColor: _cyan,
+      onChanged: (v) => setState(() => sensitivity = v),
+      onChangeEnd: (v) => unawaited(_vault.write(
+        key: '${_pref}speed', value: v.toString()))),
+    SwitchListTile.adaptive(
+      title: const Text('Ускорение курсора', style: TextStyle(color: Colors.white)),
+      subtitle: const Text('Быстрое движение пальца — быстрее курсор',
+        style: TextStyle(color: _muted, fontSize: 12)),
+      value: _accelerate, onChanged: (v) {
+        setState(() => _accelerate = v);
+        unawaited(_vault.write(key: '${_pref}accel', value: '$v'));
+      }),
+    SwitchListTile.adaptive(
+      title: const Text('Вибрация при нажатиях', style: TextStyle(color: Colors.white)),
+      value: _haptics, onChanged: (v) {
+        setState(() => _haptics = v);
+        unawaited(_vault.write(key: '${_pref}haptics', value: '$v'));
+      }),
+    const Divider(),
+    const Text('Управление: один палец — движение; короткое касание — клик; два быстрых касания — двойной клик; удержание — зажатие для перетаскивания; два пальца — прокрутка.',
+      style: TextStyle(color: _muted, height: 1.5)),
+    const SizedBox(height: 18),
+    OutlinedButton.icon(onPressed: () => unawaited(_checkLink()),
+      icon: const Icon(Icons.refresh_rounded), label: const Text('Проверить соединение')),
+    OutlinedButton.icon(onPressed: _forget,
+      icon: const Icon(Icons.link_off_rounded), label: const Text('Забыть приставку')),
   ]);
 
   Widget _tile(Widget child) => Container(
     width: double.infinity,
     padding: const EdgeInsets.all(15),
-    decoration: BoxDecoration(
-      color: _panel,
-      borderRadius: BorderRadius.circular(18),
-      border: Border.all(color: _line),
-    ),
+    decoration: BoxDecoration(color: _panel,
+      borderRadius: BorderRadius.circular(18), border: Border.all(color: _line)),
     child: child,
   );
 }
@@ -402,6 +722,7 @@ class _TvApp {
       final encoded = data['icon'];
       if (encoded is String && encoded.isNotEmpty) icon = base64Decode(encoded);
     } catch (_) {}
-    return _TvApp('${data['name'] ?? 'Приложение'}', '${data['package'] ?? ''}', icon);
+    return _TvApp('${data['name'] ?? 'Приложение'}',
+      '${data['package'] ?? ''}', icon);
   }
 }
