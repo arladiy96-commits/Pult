@@ -28,6 +28,10 @@ class CompanionServer(context: Context, private val accessibility: TvAccessibili
         const val PORT = 39678
         @Volatile var status = "Служба не запущена"
             private set
+        // Visible locally on the TV: we need to distinguish TLS failure from
+        // connectivity or expired pairing. Never logs the PIN or auth token.
+        @Volatile var connectionDiagnostic = "Подключений пока не было"
+            private set
     }
     private val pairing = CompanionState.store(context)
     private val catalog = AppCatalog(context)
@@ -67,9 +71,19 @@ class CompanionServer(context: Context, private val accessibility: TvAccessibili
         try {
             client.use { socket ->
                 // Reject clients outside RFC1918 local LAN (no Internet remote control).
-                if (!socket.inetAddress.isSiteLocalAddress && !socket.inetAddress.isLoopbackAddress) return
+                if (!socket.inetAddress.isSiteLocalAddress && !socket.inetAddress.isLoopbackAddress) {
+                    connectionDiagnostic = "Соединение отклонено: не локальная сеть"
+                    return
+                }
                 socket.soTimeout = 15000
-                socket.startHandshake()
+                try {
+                    socket.startHandshake()
+                    connectionDiagnostic = "TLS: соединение установлено"
+                } catch (e: Exception) {
+                    connectionDiagnostic = "Ошибка TLS: ${e.javaClass.simpleName}: ${e.message?.take(160) ?: "неизвестная"}"
+                    Log.e("PultTV", "TLS handshake failed", e)
+                    return
+                }
                 val input = BufferedReader(InputStreamReader(socket.inputStream, Charsets.UTF_8))
                 val output = BufferedWriter(OutputStreamWriter(socket.outputStream, Charsets.UTF_8))
                 val first = readRequest(input) ?: return

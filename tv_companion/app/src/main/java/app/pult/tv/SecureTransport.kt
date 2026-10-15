@@ -1,6 +1,5 @@
 package app.pult.tv
 
-import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import java.math.BigInteger
@@ -16,7 +15,9 @@ import javax.security.auth.x500.X500Principal
 
 /** Persistent device-generated TLS identity. Client must pin SHA-256 cert fingerprint. */
 object SecureTransport {
-    private const val ALIAS = "pult_tv_tls_v1"
+    // A new alias is essential: already-generated Android Keystore keys are immutable.
+    // v1 lacked the raw RSA operation permission needed by some Conscrypt builds.
+    private const val ALIAS = "pult_tv_tls_v2"
 
     @Synchronized private fun keyStore(): KeyStore {
         val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
@@ -28,7 +29,12 @@ object SecureTransport {
                 KeyGenParameterSpec.Builder(ALIAS,
                     KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY)
                     .setKeySize(2048)
-                    .setDigests(KeyProperties.DIGEST_SHA256)
+                    // Conscrypt may use RSA/ECB/NoPadding to perform TLS RSA-PSS signing
+                    // with an AndroidKeyStore-backed RSA key (Android 10+). Without this,
+                    // peers see "Connection terminated during handshake".
+                    // This does NOT enable use of raw RSA for application payload encryption.
+                    .setDigests(KeyProperties.DIGEST_NONE, KeyProperties.DIGEST_SHA256, KeyProperties.DIGEST_SHA512)
+                    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
                     .setSignaturePaddings(KeyProperties.SIGNATURE_PADDING_RSA_PKCS1, KeyProperties.SIGNATURE_PADDING_RSA_PSS)
                     .setCertificateSubject(X500Principal("CN=Pult TV Companion"))
                     .setCertificateSerialNumber(BigInteger.ONE)

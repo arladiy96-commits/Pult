@@ -123,6 +123,7 @@ class MainActivity : Activity() {
         } catch (e: Exception) { "Недоступен: ${e.javaClass.simpleName}" }
         info.text = "Служба управления: ${if (active) "ВКЛЮЧЕНА" else "ВЫКЛЮЧЕНА"}\n" +
             "Сервер: ${CompanionServer.status}\n" +
+            "Соединение: ${CompanionServer.connectionDiagnostic}\n" +
             "IP: $ip    Порт: ${CompanionServer.PORT}\n" +
             "Отпечаток SHA-256:\n$fingerprintText"
         val pin = pairing.visiblePin()
