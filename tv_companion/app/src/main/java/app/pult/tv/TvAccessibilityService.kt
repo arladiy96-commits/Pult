@@ -20,6 +20,7 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import org.json.JSONObject
 import kotlin.math.roundToInt
+import kotlin.math.abs
 
 /** Runs only after user turns on the accessibility service in TV settings. */
 class TvAccessibilityService : AccessibilityService() {
@@ -39,6 +40,155 @@ class TvAccessibilityService : AccessibilityService() {
     private var cursorY = 540f
     private var cursorVisible = false
 
+    // A true Accessibility drag uses continued strokes: the button stays
+    // pressed while the phone streams cursor deltas, then releases on lift.
+    private var dragActive = false
+    private var dragBusy = false
+    private var dragEnding = false
+    private var dragStroke: GestureDescription.StrokeDescription? = null
+    private var dragStrokeX = 0f
+    private var dragStrokeY = 0f
+    private var dragTargetX = 0f
+    private var dragTargetY = 0f
+    private var scrollBusy = false
+    private var scrollPending = 0.0
+
+    private fun resetDrag() {
+        dragActive = false
+        dragBusy = false
+        dragEnding = false
+        dragStroke = null
+    }
+
+    // Gesture dispatch is asynchronous. Queue scroll distance and dispatch one
+    // gesture at a time instead of cancelling an earlier scroll with the next.
+    private fun enqueueScroll(amount: Double): JSONObject {
+        if (dragActive) return fail("Завершите перетаскивание перед прокруткой")
+        scrollPending = (scrollPending + amount).coerceIn(-12.0, 12.0)
+        pumpScroll()
+        return ok()
+    }
+
+    private fun pumpScroll() {
+        if (scrollBusy || abs(scrollPending) < .1) return
+        val step = scrollPending.coerceIn(-3.0, 3.0)
+        scrollPending -= step
+        val travel = (135f * abs(step).toFloat()).coerceAtMost(screenHeight * .52f)
+        val x = cursorX.coerceIn(12f, (screenWidth - 12).toFloat())
+        val middle = cursorY.coerceIn(screenHeight * .3f, screenHeight * .7f)
+        val startY = middle + if (step > 0) travel / 2 else -travel / 2
+        val endY = middle + if (step > 0) -travel / 2 else travel / 2
+        val path = Path().apply { moveTo(x, startY); lineTo(x, endY) }
+        val stroke = GestureDescription.StrokeDescription(path, 0, 155L)
+        scrollBusy = true
+        val accepted = dispatchGesture(
+            GestureDescription.Builder().addStroke(stroke).build(),
+            object : GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription?) {
+                    scrollBusy = false
+                    pumpScroll()
+                }
+                override fun onCancelled(gestureDescription: GestureDescription?) {
+                    scrollBusy = false
+                    // Another app gesture took precedence: drop queued stale scroll.
+                    scrollPending = 0.0
+                }
+            }, main
+        )
+        if (!accepted) {
+            scrollBusy = false
+            scrollPending = 0.0
+        }
+    }
+
+    private fun startDrag(): JSONObject {
+        if (dragActive) return ok()
+        if (scrollBusy) return fail("Дождитесь завершения прокрутки")
+        dragActive = true
+        dragBusy = true
+        dragEnding = false
+        dragTargetX = cursorX
+        dragTargetY = cursorY
+        dragStrokeX = cursorX
+        dragStrokeY = cursorY
+        cursorVisible = true
+        refreshPointer()
+        // The initial stationary segment must exceed the Android long press
+        // threshold for drag-and-drop to work in ordinary launcher apps.
+        val path = Path().apply { moveTo(cursorX, cursorY) }
+        val first = GestureDescription.StrokeDescription(path, 0, 650L, true)
+        val accepted = dispatchGesture(
+            GestureDescription.Builder().addStroke(first).build(),
+            object : GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription?) {
+                    if (!dragActive) return
+                    dragStroke = first
+                    dragBusy = false
+                    pumpDrag()
+                }
+                override fun onCancelled(gestureDescription: GestureDescription?) {
+                    resetDrag()
+                }
+            }, main
+        )
+        if (!accepted) resetDrag()
+        return if (accepted) ok() else fail("Зажатие недоступно на этой приставке")
+    }
+
+    private fun moveDrag(dx: Float, dy: Float): JSONObject {
+        if (!dragActive) return fail("Сначала удерживайте палец")
+        cursorX = (cursorX + dx).coerceIn(1f, (screenWidth - 2).toFloat())
+        cursorY = (cursorY + dy).coerceIn(1f, (screenHeight - 2).toFloat())
+        cursorVisible = true
+        refreshPointer()
+        dragTargetX = cursorX
+        dragTargetY = cursorY
+        pumpDrag()
+        return ok()
+    }
+
+    private fun finishDrag(): JSONObject {
+        if (!dragActive) return ok()
+        dragEnding = true
+        pumpDrag()
+        return ok()
+    }
+
+    private fun pumpDrag() {
+        if (!dragActive || dragBusy) return
+        val previous = dragStroke ?: return
+        val finalSegment = dragEnding
+        if (!finalSegment && abs(dragTargetX - dragStrokeX) < .5f &&
+            abs(dragTargetY - dragStrokeY) < .5f) return
+        val targetX = dragTargetX
+        val targetY = dragTargetY
+        val path = Path().apply {
+            moveTo(dragStrokeX, dragStrokeY)
+            lineTo(targetX, targetY)
+        }
+        val next = previous.continueStroke(path, 0, 50L, !finalSegment)
+        dragBusy = true
+        val accepted = dispatchGesture(
+            GestureDescription.Builder().addStroke(next).build(),
+            object : GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription?) {
+                    if (!dragActive) return
+                    dragStrokeX = targetX
+                    dragStrokeY = targetY
+                    dragBusy = false
+                    if (finalSegment) resetDrag() else {
+                        dragStroke = next
+                        pumpDrag()
+                    }
+                }
+                override fun onCancelled(gestureDescription: GestureDescription?) {
+                    resetDrag()
+                }
+            }, main
+        )
+        if (!accepted) resetDrag()
+    }
+
     override fun onAccessibilityEvent(event: AccessibilityEvent?) = Unit
     override fun onInterrupt() = Unit
 
@@ -53,6 +203,7 @@ class TvAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         server?.stop()
         server = null
+        resetDrag()
         if (pointer != null) {
             try { manager?.removeView(pointer) } catch (_: Exception) {}
         }
@@ -118,6 +269,13 @@ class TvAccessibilityService : AccessibilityService() {
                 refreshPointer()
                 ok()
             }
+            "drag_start" -> startDrag()
+            "drag_move" -> {
+                val dx = req.optDouble("dx", 0.0).coerceIn(-250.0, 250.0).toFloat()
+                val dy = req.optDouble("dy", 0.0).coerceIn(-250.0, 250.0).toFloat()
+                moveDrag(dx, dy)
+            }
+            "drag_end" -> finishDrag()
             "tap" -> {
                 cursorVisible = true
                 refreshPointer()
@@ -132,16 +290,7 @@ class TvAccessibilityService : AccessibilityService() {
             }
             "scroll" -> {
                 val direction = req.optDouble("dy", 1.0).coerceIn(-4.0, 4.0)
-                if (direction == 0.0) ok() else {
-                    val travel = (100f * kotlin.math.abs(direction).toFloat()).coerceAtMost(screenHeight * .45f)
-                    val safeX = cursorX.coerceIn(12f, (screenWidth - 12).toFloat())
-                    val midY = cursorY.coerceIn(screenHeight * .3f, screenHeight * .7f)
-                    // Positive dy means scroll content DOWN (finger swipes UP).
-                    val startY = midY + if (direction > 0) travel / 2 else -travel / 2
-                    val endY = midY + if (direction > 0) -travel / 2 else travel / 2
-                    if (gesture(safeX, startY, safeX, endY, 260L)) ok()
-                    else fail("Прокрутка недоступна")
-                }
+                if (direction == 0.0) ok() else enqueueScroll(direction)
             }
             "text" -> {
                 val text = req.optString("text", "")

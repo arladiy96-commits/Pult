@@ -109,7 +109,11 @@ class CompanionServer(context: Context, private val accessibility: TvAccessibili
                     else -> false
                 }
                 if (!authorized) return
-                socket.soTimeout = 120000
+                // Keep the authenticated LAN session alive while the phone is in
+                // background. The phone rechecks it when returning to foreground.
+                socket.soTimeout = 0
+                socket.keepAlive = true
+                socket.tcpNoDelay = true
                 while (running) {
                     val req = readRequest(input) ?: break
                     if (!pairing.authenticated(sessionToken)) {
