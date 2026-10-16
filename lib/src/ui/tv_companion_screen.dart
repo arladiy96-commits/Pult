@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../services/tv_companion_client.dart';
+import '../services/tv_h264_player.dart';
 
 const _bg = Color(0xFF06101A);
 const _panel = Color(0xFF0A1C29);
@@ -39,17 +40,20 @@ class _TvCompanionScreenState extends State<TvCompanionScreen>
   Timer? _retry;
   Timer? _dragArm;
   Timer? _moveTick;
-  Timer? _screenTicker;
-  bool _screenBusy = false;
-  bool _screenLandscape = false;
+  late final TvH264Player _player = TvH264Player(_onVideoStatus);
+  int? _videoTexture;
+  bool _videoStarting = false;
+  int _videoEpoch = 0;
+  bool _screenControls = false;
+  bool _videoFill = true;
   String _screenMessage = 'На приставке включите трансляцию экрана';
-  Uint8List? _screenJpeg;
-  int _screenSequence = 0;
   int _screenWidth = 1280;
   int _screenHeight = 720;
   Offset? _screenPanFrom;
   Offset? _screenPanTo;
   DateTime? _screenPanStarted;
+  double _screenScrollDistance = 0;
+  bool _screenDidScroll = false;
   Future<void>? _movementPending;
 
   _Panel panel = _Panel.mouse;
@@ -99,9 +103,9 @@ class _TvCompanionScreenState extends State<TvCompanionScreen>
     if (_appActive) {
       _updateImmersive();
       if (paired) unawaited(_checkLink());
-      if (panel == _Panel.screen) _startScreenPoll();
+      if (panel == _Panel.screen) unawaited(_startVideo());
     } else {
-      _screenTicker?.cancel();
+      unawaited(_stopVideo());
       _retry?.cancel();
       _dragArm?.cancel();
       _touches.clear();
@@ -118,7 +122,8 @@ class _TvCompanionScreenState extends State<TvCompanionScreen>
     _dragArm?.cancel();
     _heartbeat?.cancel();
     _moveTick?.cancel();
-    _screenTicker?.cancel();
+    unawaited(_stopVideo());
+    _player.dispose();
     unawaited(SystemChrome.setPreferredOrientations([]));
     _connectionSubscription?.cancel();
     pin.dispose();
@@ -154,108 +159,102 @@ class _TvCompanionScreenState extends State<TvCompanionScreen>
   }
 
   void _showPanel(_Panel next) {
-    final previouslyScreen = panel == _Panel.screen;
-    if (next != _Panel.screen) {
-      _screenTicker?.cancel();
-      _screenJpeg = null; // Do not retain a TV screenshot after leaving the screen.
-      _screenSequence = 0;
-    }
-    if (previouslyScreen && next != _Panel.screen && _screenLandscape) {
-      _screenLandscape = false;
+    if (panel == _Panel.screen && next != _Panel.screen) {
+      unawaited(_stopVideo());
       unawaited(SystemChrome.setPreferredOrientations([]));
     }
     _dragArm?.cancel();
     _touches.clear();
     if (_dragActive) unawaited(_endDrag());
-    setState(() => panel = next);
+    setState(() { panel = next; _screenControls = false; });
     _updateImmersive();
     if (next == _Panel.apps && apps.isEmpty) unawaited(_loadApps());
-    if (next == _Panel.screen) _startScreenPoll();
-  }
-
-  void _startScreenPoll() {
-    _screenTicker?.cancel();
-    if (!_appActive || !paired) return;
-    unawaited(_fetchScreenFrame());
-    _screenTicker = Timer.periodic(const Duration(milliseconds: 150), (_) {
-      unawaited(_fetchScreenFrame());
-    });
-  }
-
-  Future<void> _fetchScreenFrame() async {
-    if (_screenBusy || !_appActive || panel != _Panel.screen || !mounted) return;
-    if (!client.isConnected) return; // Standard reconnect mechanism remains active.
-    _screenBusy = true;
-    try {
-      final answer = await client.request(
-        {'cmd': 'screen_frame', 'since': _screenSequence},
-        timeout: const Duration(seconds: 6),
-      );
-      if (!mounted || panel != _Panel.screen) return;
-      if (answer['ok'] != true) {
-        final message = '${answer['error'] ?? 'Экран недоступен'}';
-        if (_screenMessage != message || _screenJpeg != null) {
-          setState(() {
-            _screenMessage = message;
-            _screenJpeg = null;
-            _screenSequence = 0;
-          });
-        }
-        return;
-      }
-      final jpeg = answer['jpeg'];
-      if (jpeg is String && jpeg.isNotEmpty && jpeg.length < 1600000) {
-        final frame = base64Decode(jpeg);
-        setState(() {
-          _screenJpeg = frame;
-          _screenSequence = (answer['seq'] as num?)?.toInt() ?? _screenSequence;
-          _screenWidth = (answer['width'] as num?)?.toInt() ?? 1280;
-          _screenHeight = (answer['height'] as num?)?.toInt() ?? 720;
-          _screenMessage = 'Прямая трансляция · ${_screenWidth}×$_screenHeight';
-        });
-      } else if (answer['waiting'] == true && _screenJpeg == null &&
-          _screenMessage != 'Ожидание первого кадра…') {
-        setState(() => _screenMessage = 'Ожидание первого кадра…');
-      }
-    } catch (e) {
-      if (mounted && panel == _Panel.screen) {
-        setState(() => _screenMessage = 'Нет видеосвязи: $e');
-      }
-    } finally {
-      _screenBusy = false;
+    if (next == _Panel.screen) {
+      unawaited(SystemChrome.setPreferredOrientations([
+        DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight,
+      ]));
+      unawaited(_startVideo());
     }
   }
 
-  Future<void> _toggleScreenOrientation() async {
-    final next = !_screenLandscape;
-    setState(() => _screenLandscape = next);
-    await SystemChrome.setPreferredOrientations(next
-        ? [DeviceOrientation.landscapeLeft, DeviceOrientation.landscapeRight]
-        : [DeviceOrientation.portraitUp]);
-    _updateImmersive();
+  void _onVideoStatus(String message, int width, int height) {
+    if (!mounted || panel != _Panel.screen) return;
+    setState(() {
+      _screenMessage = message;
+      _screenWidth = width;
+      _screenHeight = height;
+    });
+  }
+
+  Future<void> _startVideo() async {
+    if (!mounted || !paired || !_appActive || panel != _Panel.screen ||
+        _videoStarting || _videoTexture != null) return;
+    _videoStarting = true;
+    final epoch = ++_videoEpoch;
+    try {
+      final identity = await client.storedIdentity();
+      if (identity == null) throw StateError('Нет сопряжения с приставкой');
+      final texture = await _player.start(host: widget.host,
+          fingerprint: identity.fingerprint, token: identity.token);
+      if (!mounted || panel != _Panel.screen || !_appActive || epoch != _videoEpoch) {
+        await _player.stop();
+        return;
+      }
+      setState(() => _videoTexture = texture);
+    } catch (e) {
+      if (mounted && panel == _Panel.screen) {
+        setState(() => _screenMessage = 'Ошибка видеопотока: $e');
+      }
+    } finally {
+      _videoStarting = false;
+      if (mounted && _appActive && panel == _Panel.screen &&
+          _videoTexture == null && epoch != _videoEpoch) {
+        unawaited(_startVideo());
+      }
+    }
+  }
+
+  Future<void> _stopVideo() async {
+    ++_videoEpoch;
+    _videoTexture = null;
+    try { await _player.stop(); } catch (_) { }
+  }
+
+  Offset? _screenNormalize(Offset touch, Size size) {
+    if (size.width <= 0 || size.height <= 0) return null;
+    final scale = _videoFill
+        ? math.max(size.width / _screenWidth, size.height / _screenHeight)
+        : math.min(size.width / _screenWidth, size.height / _screenHeight);
+    final drawnWidth = _screenWidth * scale;
+    final drawnHeight = _screenHeight * scale;
+    final left = (size.width - drawnWidth) / 2;
+    final top = (size.height - drawnHeight) / 2;
+    final x = (touch.dx - left) / drawnWidth;
+    final y = (touch.dy - top) / drawnHeight;
+    if (!_videoFill && (x < 0 || x > 1 || y < 0 || y > 1)) return null;
+    return Offset(x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
   }
 
   void _screenTouch(String command, Offset position, Size size) {
-    if (!connected || _screenJpeg == null || size.width <= 0 || size.height <= 0) return;
-    final x = (position.dx / size.width).clamp(0.0, 1.0);
-    final y = (position.dy / size.height).clamp(0.0, 1.0);
-    _command(command, {'x': x, 'y': y});
+    if (!connected || _videoTexture == null) return;
+    final point = _screenNormalize(position, size);
+    if (point == null) return;
+    _command(command, {'x': point.dx, 'y': point.dy});
   }
 
   void _screenSwipe(Size size) {
     final from = _screenPanFrom;
     final to = _screenPanTo;
-    if (_screenJpeg == null || from == null || to == null ||
-        size.width <= 0 || size.height <= 0) return;
-    if ((from - to).distance < 12) return;
-    final ms = DateTime.now().difference(_screenPanStarted ?? DateTime.now())
-        .inMilliseconds.clamp(120, 750);
+    if (!connected || _screenDidScroll || from == null || to == null ||
+        (from - to).distance < 12) return;
+    final a = _screenNormalize(from, size);
+    final b = _screenNormalize(to, size);
+    if (a == null || b == null) return;
+    final elapsed = DateTime.now().difference(_screenPanStarted ?? DateTime.now())
+        .inMilliseconds.clamp(130, 700);
     _command('screen_swipe', {
-      'x1': (from.dx / size.width).clamp(0.0, 1.0),
-      'y1': (from.dy / size.height).clamp(0.0, 1.0),
-      'x2': (to.dx / size.width).clamp(0.0, 1.0),
-      'y2': (to.dy / size.height).clamp(0.0, 1.0),
-      'duration': ms,
+      'x1': a.dx, 'y1': a.dy, 'x2': b.dx, 'y2': b.dy,
+      'duration': elapsed,
     });
   }
 
@@ -666,71 +665,105 @@ class _TvCompanionScreenState extends State<TvCompanionScreen>
     ),
   ]);
 
-  Widget _fullscreenScreen() => SafeArea(child: Column(children: [
-    Padding(padding: const EdgeInsets.fromLTRB(8, 4, 8, 4), child: Row(children: [
-      _mouseButton(Icons.mouse_rounded, 'Мышь', () => _showPanel(_Panel.mouse)),
-      const SizedBox(width: 8),
-      Expanded(child: Text('ЭКРАН X96', style: const TextStyle(
-        color: Colors.white, fontWeight: FontWeight.bold, letterSpacing: 1.4))),
-      _mouseButton(Icons.refresh_rounded, 'Обновить', () => unawaited(_fetchScreenFrame())),
-      const SizedBox(width: 6),
-      _mouseButton(Icons.screen_rotation_rounded, 'Повернуть экран',
-        () => unawaited(_toggleScreenOrientation())),
-      const SizedBox(width: 6),
-      _mouseButton(Icons.keyboard_rounded, 'Клавиатура', () => _showPanel(_Panel.keyboard)),
-    ])),
-    Expanded(child: LayoutBuilder(builder: (context, limits) {
-      final aspect = _screenWidth / math.max(1, _screenHeight);
-      final width = math.min(limits.maxWidth, limits.maxHeight * aspect);
-      final height = width / aspect;
-      final imageSize = Size(width, height);
-      return Center(child: GestureDetector(
+  Widget _fullscreenScreen() => LayoutBuilder(builder: (context, constraints) {
+    final screenSize = Size(constraints.maxWidth, constraints.maxHeight);
+    return Stack(children: [
+      Positioned.fill(child: GestureDetector(
         behavior: HitTestBehavior.opaque,
-        onTapUp: (d) => _screenTouch('screen_tap', d.localPosition, imageSize),
-        onLongPressStart: (d) => _screenTouch('screen_long', d.localPosition, imageSize),
+        onTapUp: (d) => _screenTouch('screen_tap', d.localPosition, screenSize),
+        onLongPressStart: (d) => _screenTouch('screen_long', d.localPosition, screenSize),
         onPanStart: (d) {
           _screenPanFrom = d.localPosition;
           _screenPanTo = d.localPosition;
           _screenPanStarted = DateTime.now();
+          _screenDidScroll = false;
+          _screenScrollDistance = 0;
         },
-        onPanUpdate: (d) => _screenPanTo = d.localPosition,
-        onPanEnd: (_) => _screenSwipe(imageSize),
-        child: SizedBox(width: width, height: height, child: _screenJpeg == null
-          ? Container(color: _panel, alignment: Alignment.center,
-              padding: const EdgeInsets.all(24),
-              child: const Column(mainAxisAlignment: MainAxisAlignment.center, children: [
-                Icon(Icons.tv_off_rounded, color: _muted, size: 44),
-                SizedBox(height: 12),
-                Text('Включите трансляцию в Pult-TV на приставке',
-                  textAlign: TextAlign.center, style: TextStyle(color: Colors.white)),
-              ]))
-          : Image.memory(_screenJpeg!, gaplessPlayback: true,
-              filterQuality: FilterQuality.low, fit: BoxFit.fill,
-              errorBuilder: (_, _, _) => const Center(
-                child: Text('Не удалось показать кадр', style: TextStyle(color: _muted)))),
-        )),
-      );
-    })),
-    Padding(padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
-      child: Text(_screenMessage,
-        overflow: TextOverflow.ellipsis, maxLines: 2,
-        textAlign: TextAlign.center,
-        style: const TextStyle(color: _muted, fontSize: 11))),
-    Padding(padding: const EdgeInsets.fromLTRB(10, 0, 10, 10),
-      child: Row(children: [
-        Expanded(child: _mouseWide(Icons.arrow_back_rounded, 'Назад',
-          () => _command('key', {'code': 4}))),
-        const SizedBox(width: 7),
-        Expanded(child: _mouseWide(Icons.home_rounded, 'Домой',
-          () => _command('key', {'code': 3}))),
-        const SizedBox(width: 7),
-        Expanded(child: _mouseWide(Icons.mouse_rounded, 'Мышь',
-          () => _showPanel(_Panel.mouse))),
-        const SizedBox(width: 7),
-        Expanded(child: _mouseWide(Icons.apps_rounded, 'Приложения',
-          () => _showPanel(_Panel.apps))),
-      ])),
-  ]));
+        onPanUpdate: (d) {
+          _screenPanTo = d.localPosition;
+          final start = _screenPanFrom;
+          if (start == null) return;
+          final travel = d.localPosition - start;
+          // Scroll visible lists *during* the gesture, not only on finger-up.
+          if (travel.dy.abs() > travel.dx.abs() * 1.4 && travel.dy.abs() > 18) {
+            _screenScrollDistance += d.delta.dy;
+            if (_screenScrollDistance.abs() >= 62) {
+              final point = _screenNormalize(d.localPosition, screenSize);
+              if (point != null && connected) {
+                _command('screen_scroll', {
+                  'x': point.dx, 'y': point.dy,
+                  'dy': _screenScrollDistance < 0 ? 1 : -1,
+                });
+                _screenDidScroll = true;
+              }
+              _screenScrollDistance = 0;
+            }
+          }
+        },
+        onPanEnd: (_) => _screenSwipe(screenSize),
+        child: Container(color: Colors.black, child: _videoTexture == null
+          ? Center(child: Text(_screenMessage, textAlign: TextAlign.center,
+              style: const TextStyle(color: _muted, fontSize: 14)))
+          : SizedBox.expand(child: FittedBox(
+              fit: _videoFill ? BoxFit.cover : BoxFit.contain,
+              child: SizedBox(width: _screenWidth.toDouble(),
+                  height: _screenHeight.toDouble(),
+                  child: Texture(textureId: _videoTexture!,
+                      filterQuality: FilterQuality.low)),
+          )),
+        ),
+      )),
+      Positioned(top: 9, right: 9, child: _mouseButton(
+        _screenControls ? Icons.close_rounded : Icons.tune_rounded,
+        _screenControls ? 'Скрыть панель' : 'Управление',
+        () => setState(() => _screenControls = !_screenControls),
+      )),
+      if (_screenControls) ...[
+        Positioned(top: 8, left: 10, right: 65,
+          child: Row(children: [
+            _mouseButton(Icons.mouse_rounded, 'Мышь', () => _showPanel(_Panel.mouse)),
+            const SizedBox(width: 6),
+            _mouseButton(Icons.apps_rounded, 'Приложения', () => _showPanel(_Panel.apps)),
+            const SizedBox(width: 6),
+            _mouseButton(Icons.keyboard_rounded, 'Клавиатура', () => _showPanel(_Panel.keyboard)),
+            const SizedBox(width: 6),
+            _mouseButton(_videoFill ? Icons.fit_screen : Icons.fullscreen,
+                _videoFill ? 'Без обрезки' : 'Заполнить экран',
+                () => setState(() => _videoFill = !_videoFill)),
+            const SizedBox(width: 6),
+            _mouseButton(Icons.refresh_rounded, 'Переподключить видео', () async {
+              await _stopVideo();
+              if (mounted) { setState(() {}); unawaited(_startVideo()); }
+            }),
+          ])),
+        Positioned(bottom: 8, left: 10, right: 10,
+          child: Row(children: [
+            Expanded(child: _mouseWide(Icons.arrow_back_rounded, 'Назад',
+                () => _command('key', {'code': 4}))),
+            const SizedBox(width: 8),
+            Expanded(child: _mouseWide(Icons.home_rounded, 'Домой',
+                () => _command('key', {'code': 3}))),
+            const SizedBox(width: 8),
+            Expanded(child: _mouseWide(Icons.keyboard_arrow_up_rounded, 'Вверх',
+                () => _command('screen_swipe',
+                    {'x1': .5, 'y1': .25, 'x2': .5, 'y2': .8, 'duration': 250}))),
+            const SizedBox(width: 8),
+            Expanded(child: _mouseWide(Icons.keyboard_arrow_down_rounded, 'Вниз',
+                () => _command('screen_swipe',
+                    {'x1': .5, 'y1': .8, 'x2': .5, 'y2': .25, 'duration': 250}))),
+          ])),
+        Positioned(bottom: 66, left: 12, right: 12,
+          child: IgnorePointer(child: Center(child: Container(
+            decoration: BoxDecoration(color: _panel.withValues(alpha: .92),
+                borderRadius: BorderRadius.circular(14)),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+            child: Text(_screenMessage,
+              maxLines: 1, overflow: TextOverflow.ellipsis,
+              style: const TextStyle(color: Colors.white, fontSize: 11)),
+          )))),
+      ],
+    ]);
+  });
 
   Widget _mouseButton(IconData icon, String tooltip, VoidCallback action) =>
       IconButton.filledTonal(
