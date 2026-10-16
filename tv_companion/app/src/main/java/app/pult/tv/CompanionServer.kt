@@ -9,6 +9,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.BufferedWriter
+import java.io.DataOutputStream
+import java.io.BufferedOutputStream
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.SocketException
@@ -121,6 +123,19 @@ class CompanionServer(context: Context, private val accessibility: TvAccessibili
                         send(output, fail("Доступ отозван. Выполните новое сопряжение"))
                         break
                     }
+                    // Video lives on its own authenticated TLS connection. Do not
+                    // block control gestures behind large media packets.
+                    if (req.optString("cmd") == "video_stream") {
+                        if (!ScreenCaptureService.sharing) {
+                            send(output, fail("На приставке включите трансляцию экрана"))
+                        } else {
+                            send(output, JSONObject().put("ok", true)
+                                .put("codec", "avc1").put("width", ScreenCaptureService.videoWidth)
+                                .put("height", ScreenCaptureService.videoHeight))
+                            streamAvc(socket)
+                        }
+                        return
+                    }
                     val reply = try { execute(req) } catch (e: Exception) {
                         fail("Команда не выполнена: ${e.javaClass.simpleName}")
                     }
@@ -139,22 +154,7 @@ class CompanionServer(context: Context, private val accessibility: TvAccessibili
             "screen_info" -> JSONObject().put("ok", true)
                 .put("sharing", ScreenCaptureService.sharing)
                 .put("status", ScreenCaptureService.status)
-            "screen_frame" -> {
-                // A single newest-frame reply: no video queue and no open LAN endpoint.
-                if (!ScreenCaptureService.sharing) {
-                    fail("Включите «Начать трансляцию экрана» в приложении на приставке")
-                } else {
-                    val frame = ScreenCaptureService.latestFrame
-                    if (frame == null) JSONObject().put("ok", true).put("waiting", true)
-                    else if (frame.sequence == req.optLong("since", 0L)) {
-                        JSONObject().put("ok", true).put("unchanged", true)
-                    } else JSONObject().put("ok", true)
-                        .put("seq", frame.sequence)
-                        .put("width", frame.width)
-                        .put("height", frame.height)
-                        .put("jpeg", Base64.encodeToString(frame.jpeg, Base64.NO_WRAP))
-                }
-            }
+            "screen_frame" -> fail("Обновите пульт: трансляция использует H.264")
             "launch" -> {
                 val pkg = req.optString("package")
                 onMain {
@@ -164,6 +164,43 @@ class CompanionServer(context: Context, private val accessibility: TvAccessibili
             }
             else -> onMain { accessibility.handle(req) }
         }
+    }
+
+    /** Length-prefixed AVC access units: 4B length, 8B ptsUs, 4B MediaCodec flags, payload. */
+    private fun streamAvc(socket: SSLSocket) {
+        socket.soTimeout = 0
+        socket.tcpNoDelay = true
+        val output = DataOutputStream(BufferedOutputStream(socket.outputStream, 64 * 1024))
+        var cursor = ScreenCaptureService.latestSequence()
+        var waitingKeyframe = true
+        var lastSyncAt = 0L
+        while (running && ScreenCaptureService.sharing) {
+            val packet = ScreenCaptureService.awaitPacket(cursor, 500) ?: continue
+            if (!waitingKeyframe && packet.seq != cursor + 1L) waitingKeyframe = true
+            cursor = packet.seq
+            if (waitingKeyframe) {
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (now - lastSyncAt > 700L) {
+                    ScreenCaptureService.requestKeyFrame()
+                    lastSyncAt = now
+                }
+                if ((packet.flags and android.media.MediaCodec.BUFFER_FLAG_KEY_FRAME) == 0) continue
+                val config = ScreenCaptureService.codecConfig() ?: continue
+                // Initial SPS/PPS and every resynchronization after a dropped GOP.
+                writePacket(output, config, 0L, android.media.MediaCodec.BUFFER_FLAG_CODEC_CONFIG)
+                waitingKeyframe = false
+            }
+            writePacket(output, packet.bytes, packet.ptsUs, packet.flags)
+            output.flush()
+        }
+    }
+
+    private fun writePacket(output: DataOutputStream, bytes: ByteArray, pts: Long, flags: Int) {
+        if (bytes.isEmpty() || bytes.size > 2_000_000) return
+        output.writeInt(bytes.size)
+        output.writeLong(pts)
+        output.writeInt(flags)
+        output.write(bytes)
     }
 
     private fun onMain(action: () -> JSONObject): JSONObject {

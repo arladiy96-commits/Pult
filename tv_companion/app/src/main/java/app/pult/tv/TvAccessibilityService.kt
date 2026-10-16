@@ -3,6 +3,7 @@ package app.pult.tv
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.graphics.Canvas
+import android.graphics.Rect
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Path
@@ -279,13 +280,30 @@ class TvAccessibilityService : AccessibilityService() {
                 val y = normalized(req, "y", screenHeight)
                 if (gesture(x, y, x, y, 750L)) ok() else fail("Долгое нажатие недоступно")
             }
+            "screen_scroll" -> {
+                val x = normalized(req, "x", screenWidth)
+                val y = normalized(req, "y", screenHeight)
+                val direction = req.optInt("dy", 1)
+                if (scrollNodeAt(x, y, direction > 0)) ok()
+                else {
+                    cursorX = x
+                    cursorY = y
+                    enqueueScroll(if (direction > 0) 1.0 else -1.0)
+                }
+            }
             "screen_swipe" -> {
                 val x1 = normalized(req, "x1", screenWidth)
                 val y1 = normalized(req, "y1", screenHeight)
                 val x2 = normalized(req, "x2", screenWidth)
                 val y2 = normalized(req, "y2", screenHeight)
                 val duration = req.optLong("duration", 280L).coerceIn(100L, 900L)
-                if (gesture(x1, y1, x2, y2, duration)) ok()
+                // Android TV lists sometimes ignore touchscreen swipes, but expose
+                // Accessibility ACTION_SCROLL_FORWARD/BACKWARD. Prefer that for
+                // predominantly vertical gestures, falling back to a real swipe.
+                val vertical = abs(y2 - y1) > abs(x2 - x1) * 1.5f &&
+                    abs(y2 - y1) > 35f
+                val scrolled = vertical && scrollNodeAt(x1, y1, y2 < y1)
+                if (scrolled || gesture(x1, y1, x2, y2, duration)) ok()
                 else fail("Не удалось выполнить жест")
             }
             "drag_start" -> startDrag()
@@ -330,6 +348,38 @@ class TvAccessibilityService : AccessibilityService() {
             }
             else -> fail("Неизвестная команда")
         }
+    }
+
+    private fun scrollNodeAt(x: Float, y: Float, forward: Boolean): Boolean {
+        val root = rootInActiveWindow ?: return false
+        val action = if (forward) AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
+                     else AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
+        val queue = java.util.ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var count = 0
+        var result = false
+        try {
+            while (queue.isNotEmpty() && count++ < 180) {
+                val node = queue.removeFirst()
+                val bounds = Rect()
+                node.getBoundsInScreen(bounds)
+                if (bounds.contains(x.toInt(), y.toInt())) {
+                    if (node.isScrollable && node.performAction(action)) {
+                        result = true
+                        node.recycle()
+                        break
+                    }
+                    for (i in 0 until node.childCount) {
+                        node.getChild(i)?.let { queue.add(it) }
+                    }
+                }
+                node.recycle()
+            }
+        } catch (_: Exception) { /* Some vendor accessibility trees are incomplete. */
+        } finally {
+            while (queue.isNotEmpty()) queue.removeFirst().recycle()
+        }
+        return result
     }
 
     // The phone sends fractions of the captured image, NOT raw phone pixels.
