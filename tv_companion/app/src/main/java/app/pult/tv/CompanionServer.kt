@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.os.SystemClock
 import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
@@ -131,8 +132,10 @@ class CompanionServer(context: Context, private val accessibility: TvAccessibili
                         } else {
                             send(output, JSONObject().put("ok", true)
                                 .put("codec", "avc1").put("width", ScreenCaptureService.videoWidth)
-                                .put("height", ScreenCaptureService.videoHeight))
-                            streamAvc(socket)
+                                .put("height", ScreenCaptureService.videoHeight)
+                                .put("packetStats", req.optBoolean("stats", false)))
+                            streamAvc(socket, req.optBoolean("ack", false),
+                                req.optBoolean("stats", false))
                         }
                         return
                     }
@@ -154,6 +157,8 @@ class CompanionServer(context: Context, private val accessibility: TvAccessibili
             "screen_info" -> JSONObject().put("ok", true)
                 .put("sharing", ScreenCaptureService.sharing)
                 .put("status", ScreenCaptureService.status)
+                .put("encoder", ScreenCaptureService.encoderName)
+                .put("fps", ScreenCaptureService.actualEncodedFps)
             "screen_frame" -> fail("Обновите пульт: трансляция использует H.264")
             "launch" -> {
                 val pkg = req.optString("package")
@@ -166,41 +171,79 @@ class CompanionServer(context: Context, private val accessibility: TvAccessibili
         }
     }
 
-    /** Length-prefixed AVC access units: 4B length, 8B ptsUs, 4B MediaCodec flags, payload. */
-    private fun streamAvc(socket: SSLSocket) {
-        socket.soTimeout = 0
+    /** AVC access units. New phone clients ACK each packet to prevent TCP/video backlog.
+     * Older clients can still connect without flow control, so rollout is safe.
+     */
+    private fun streamAvc(socket: SSLSocket, flowControl: Boolean,
+            telemetry: Boolean) {
         socket.tcpNoDelay = true
-        val output = DataOutputStream(BufferedOutputStream(socket.outputStream, 64 * 1024))
+        if (flowControl) {
+            socket.sendBufferSize = 64 * 1024
+            socket.soTimeout = 4000
+        } else {
+            socket.soTimeout = 0
+        }
+        val output = DataOutputStream(BufferedOutputStream(socket.outputStream, 32 * 1024))
+        // JSON authentication has finished. Flow-control bytes start only after
+        // this server has sent the first config/frame, so the JSON reader cannot
+        // prefetch an ACK accidentally.
+        val acknowledgements = if (flowControl) socket.inputStream else null
         var cursor = ScreenCaptureService.latestSequence()
         var waitingKeyframe = true
         var lastSyncAt = 0L
         while (running && ScreenCaptureService.sharing) {
-            val packet = ScreenCaptureService.awaitPacket(cursor, 500) ?: continue
+            // Never deliver seconds-old pictures. Frames between IDRs depend on
+            // each other, so dropping arbitrary P-frames would corrupt playback.
+            // Jump to live edge and request an IDR instead.
+            if (ScreenCaptureService.latestSequence() - cursor > 6L) {
+                cursor = ScreenCaptureService.latestSequence()
+                waitingKeyframe = true
+            }
+            val packet = ScreenCaptureService.awaitPacket(cursor, 450) ?: continue
             if (!waitingKeyframe && packet.seq != cursor + 1L) waitingKeyframe = true
             cursor = packet.seq
+            // Even if sequence numbers are contiguous, a stalled encoder or
+            // slow socket must not show yesterday's frame after the user taps.
+            if (SystemClock.elapsedRealtime() - packet.encodedAtMs > 200L) {
+                cursor = ScreenCaptureService.latestSequence()
+                waitingKeyframe = true
+                continue
+            }
             if (waitingKeyframe) {
                 val now = android.os.SystemClock.elapsedRealtime()
-                if (now - lastSyncAt > 700L) {
+                if (now - lastSyncAt > 450L) {
                     ScreenCaptureService.requestKeyFrame()
                     lastSyncAt = now
                 }
                 if ((packet.flags and android.media.MediaCodec.BUFFER_FLAG_KEY_FRAME) == 0) continue
                 val config = ScreenCaptureService.codecConfig() ?: continue
-                // Initial SPS/PPS and every resynchronization after a dropped GOP.
-                writePacket(output, config, 0L, android.media.MediaCodec.BUFFER_FLAG_CODEC_CONFIG)
+                if (!writePacket(output, config, 0L,
+                        android.media.MediaCodec.BUFFER_FLAG_CODEC_CONFIG,
+                        telemetry, 0)) continue
+                output.flush()
+                if (flowControl && acknowledgements?.read() != 0x06) return
                 waitingKeyframe = false
             }
-            writePacket(output, packet.bytes, packet.ptsUs, packet.flags)
+            val pendingMs = (SystemClock.elapsedRealtime() - packet.encodedAtMs)
+                .coerceIn(0L, 60000L).toInt()
+            if (!writePacket(output, packet.bytes, packet.ptsUs, packet.flags,
+                    telemetry, pendingMs)) continue
             output.flush()
+            if (flowControl && acknowledgements?.read() != 0x06) return
         }
     }
 
-    private fun writePacket(output: DataOutputStream, bytes: ByteArray, pts: Long, flags: Int) {
-        if (bytes.isEmpty() || bytes.size > 2_000_000) return
+    private fun writePacket(output: DataOutputStream, bytes: ByteArray,
+            pts: Long, flags: Int, telemetry: Boolean, encodedWaitMs: Int): Boolean {
+        if (bytes.isEmpty() || bytes.size > 2_000_000) return false
         output.writeInt(bytes.size)
         output.writeLong(pts)
         output.writeInt(flags)
+        // Optional protocol extension: only clients explicitly requesting
+        // stats expect the fourth integer in each packet header.
+        if (telemetry) output.writeInt(encodedWaitMs)
         output.write(bytes)
+        return true
     }
 
     private fun onMain(action: () -> JSONObject): JSONObject {

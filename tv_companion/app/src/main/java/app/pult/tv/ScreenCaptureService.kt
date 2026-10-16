@@ -21,6 +21,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
+import android.os.SystemClock
 import android.view.Surface
 import android.view.WindowManager
 import java.util.ArrayDeque
@@ -30,7 +31,10 @@ import kotlin.math.roundToInt
 
 /** TV-initiated MediaProjection -> hardware AVC encoder. No screen data saved to disk. */
 class ScreenCaptureService : Service() {
-    data class Packet(val seq: Long, val ptsUs: Long, val flags: Int, val bytes: ByteArray)
+    data class Packet(
+        val seq: Long, val ptsUs: Long, val flags: Int, val bytes: ByteArray,
+        val encodedAtMs: Long,
+    )
 
     companion object {
         const val ACTION_START = "app.pult.tv.screen.START"
@@ -52,6 +56,10 @@ class ScreenCaptureService : Service() {
         @Volatile var videoHeight: Int = 720
             private set
         @Volatile private var parameterSets: ByteArray? = null
+        @Volatile var encoderName: String = "не запущен"
+            private set
+        @Volatile var actualEncodedFps: Int = 0
+            private set
 
         fun requestKeyFrame() = instance?.requestSyncFrame()
         fun latestSequence(): Long = packetSequence.get()
@@ -140,7 +148,9 @@ class ScreenCaptureService : Service() {
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, 2_500_000)
+            // 720p at 30 FPS, intentionally conservative for older Amlogic hardware.
+            // 1.6 Mbps CBR-ish rate avoids bursty network congestion on home Wi-Fi.
+            setInteger(MediaFormat.KEY_BIT_RATE, 1_600_000)
             setInteger(MediaFormat.KEY_FRAME_RATE, 30)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
         }
@@ -155,6 +165,7 @@ class ScreenCaptureService : Service() {
         val codec = if (hardware != null) MediaCodec.createByCodecName(hardware.name)
                     else MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
         encoder = codec
+        encoderName = codec.name
         codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         inputSurface = codec.createInputSurface()
         val handlerThread = HandlerThread("PultProjection")
@@ -182,7 +193,8 @@ class ScreenCaptureService : Service() {
         closing = false
         sharing = true
         instance = this
-        status = "H.264 · ${width}×$height · 30 FPS (цель)"
+        actualEncodedFps = 0
+        status = "H.264 · ${width}×$height · ${codec.name}"
         drainThread = Thread({ drain(codec) }, "PultH264Encoder").also { it.start() }
     }
 
@@ -198,6 +210,8 @@ class ScreenCaptureService : Service() {
 
     private fun drain(codec: MediaCodec) {
         val info = MediaCodec.BufferInfo()
+        var fpsWindowMs = SystemClock.elapsedRealtime()
+        var fpsSamples = 0
         while (sharing && !closing) {
             try {
                 when (val index = codec.dequeueOutputBuffer(info, 12000)) {
@@ -226,10 +240,20 @@ class ScreenCaptureService : Service() {
                                 parameterSets = data
                             } else {
                                 val packet = Packet(packetSequence.incrementAndGet(),
-                                    info.presentationTimeUs, info.flags, data)
+                                    info.presentationTimeUs, info.flags, data,
+                                    SystemClock.elapsedRealtime())
+                                fpsSamples++
+                                val now = SystemClock.elapsedRealtime()
+                                if (now - fpsWindowMs >= 2000L) {
+                                    actualEncodedFps = (fpsSamples * 1000L /
+                                        (now - fpsWindowMs).coerceAtLeast(1L)).toInt()
+                                    fpsSamples = 0
+                                    fpsWindowMs = now
+                                }
                                 synchronized(packetLock) {
                                     packetBuffer.addLast(packet)
-                                    while (packetBuffer.size > 100) packetBuffer.removeFirst()
+                                    // Retain enough for keyframe recovery, not several seconds of stale video.
+                                    while (packetBuffer.size > 12) packetBuffer.removeFirst()
                                     packetLock.notifyAll()
                                 }
                             }
@@ -266,6 +290,7 @@ class ScreenCaptureService : Service() {
         inputSurface?.release(); inputSurface = null
         captureThread?.quitSafely(); captureThread = null
         parameterSets = null
+        actualEncodedFps = 0
         if (!status.startsWith("Ошибка H.264") && !status.startsWith("Android остановил"))
             status = "Трансляция выключена"
         super.onDestroy()
