@@ -269,6 +269,25 @@ class TvAccessibilityService : AccessibilityService() {
                 refreshPointer()
                 ok()
             }
+            "screen_tap" -> {
+                val x = normalized(req, "x", screenWidth)
+                val y = normalized(req, "y", screenHeight)
+                if (gesture(x, y, x, y, 60L)) ok() else fail("Не удалось нажать на экран")
+            }
+            "screen_long" -> {
+                val x = normalized(req, "x", screenWidth)
+                val y = normalized(req, "y", screenHeight)
+                if (gesture(x, y, x, y, 750L)) ok() else fail("Долгое нажатие недоступно")
+            }
+            "screen_swipe" -> {
+                val x1 = normalized(req, "x1", screenWidth)
+                val y1 = normalized(req, "y1", screenHeight)
+                val x2 = normalized(req, "x2", screenWidth)
+                val y2 = normalized(req, "y2", screenHeight)
+                val duration = req.optLong("duration", 280L).coerceIn(100L, 900L)
+                if (gesture(x1, y1, x2, y2, duration)) ok()
+                else fail("Не удалось выполнить жест")
+            }
             "drag_start" -> startDrag()
             "drag_move" -> {
                 val dx = req.optDouble("dx", 0.0).coerceIn(-250.0, 250.0).toFloat()
@@ -311,6 +330,12 @@ class TvAccessibilityService : AccessibilityService() {
             }
             else -> fail("Неизвестная команда")
         }
+    }
+
+    // The phone sends fractions of the captured image, NOT raw phone pixels.
+    private fun normalized(req: JSONObject, key: String, dimension: Int): Float {
+        val value = req.optDouble(key, 0.5).let { if (it.isFinite()) it else 0.5 }
+        return (value.coerceIn(0.0, 1.0) * (dimension - 1)).toFloat()
     }
 
     private fun gesture(x1: Float, y1: Float, x2: Float, y2: Float, durationMs: Long): Boolean {

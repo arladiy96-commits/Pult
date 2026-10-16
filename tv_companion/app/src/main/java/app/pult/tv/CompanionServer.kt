@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -135,6 +136,25 @@ class CompanionServer(context: Context, private val accessibility: TvAccessibili
         return when (req.optString("cmd")) {
             "ping" -> JSONObject().put("ok", true).put("version", 1)
             "apps" -> JSONObject().put("ok", true).put("apps", catalog.apps())
+            "screen_info" -> JSONObject().put("ok", true)
+                .put("sharing", ScreenCaptureService.sharing)
+                .put("status", ScreenCaptureService.status)
+            "screen_frame" -> {
+                // A single newest-frame reply: no video queue and no open LAN endpoint.
+                if (!ScreenCaptureService.sharing) {
+                    fail("Включите «Начать трансляцию экрана» в приложении на приставке")
+                } else {
+                    val frame = ScreenCaptureService.latestFrame
+                    if (frame == null) JSONObject().put("ok", true).put("waiting", true)
+                    else if (frame.sequence == req.optLong("since", 0L)) {
+                        JSONObject().put("ok", true).put("unchanged", true)
+                    } else JSONObject().put("ok", true)
+                        .put("seq", frame.sequence)
+                        .put("width", frame.width)
+                        .put("height", frame.height)
+                        .put("jpeg", Base64.encodeToString(frame.jpeg, Base64.NO_WRAP))
+                }
+            }
             "launch" -> {
                 val pkg = req.optString("package")
                 onMain {

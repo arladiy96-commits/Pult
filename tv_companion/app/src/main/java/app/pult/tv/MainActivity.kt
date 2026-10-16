@@ -2,6 +2,9 @@ package app.pult.tv
 
 import android.app.Activity
 import android.content.Intent
+import android.content.Context
+import android.media.projection.MediaProjectionManager
+import android.os.Build
 import android.graphics.Color
 import android.graphics.Typeface
 import android.os.Bundle
@@ -21,6 +24,7 @@ import java.util.Collections
 
 /** TV-facing installation, permissions, pairing, and local cursor test screen. */
 class MainActivity : Activity() {
+    private val captureRequest = 7201
     private val bg = Color.rgb(6, 16, 26)
     private val text = Color.rgb(244, 250, 255)
     private val secondary = Color.rgb(142, 167, 186)
@@ -79,6 +83,22 @@ class MainActivity : Activity() {
         }
 
         gap(root, 18)
+        root.addView(label("ЭКРАН ТЕЛЕВИЗОРА НА ТЕЛЕФОНЕ", 21f, cyan, true))
+        root.addView(label("Трансляция работает только после вашего подтверждения на приставке. Изображение передаётся сопряжённому телефону в локальной сети. Звук не передаётся.", 14f, secondary))
+        action(root, "НАЧАТЬ ТРАНСЛЯЦИЮ ЭКРАНА", "Android покажет системное окно разрешения захвата экрана") {
+            if (ScreenCaptureService.sharing) {
+                info.text = "Трансляция уже включена"
+                return@action
+            }
+            val projection = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            startActivityForResult(projection.createScreenCaptureIntent(), captureRequest)
+        }
+        action(root, "ОСТАНОВИТЬ ТРАНСЛЯЦИЮ", "Немедленно отключает доступ к изображению с экрана") {
+            startService(Intent(this, ScreenCaptureService::class.java).apply {
+                action = ScreenCaptureService.ACTION_STOP
+            })
+        }
+        gap(root, 18)
         root.addView(label("СОПРЯЖЕНИЕ", 21f, cyan, true))
         root.addView(label("Телефон и приставка должны быть в одной локальной сети. Откройте окно сопряжения только когда готовы вводить код.", 14f, secondary))
         gap(root, 7)
@@ -103,6 +123,23 @@ class MainActivity : Activity() {
         root.addView(label("Соединение защищено TLS. Перед первым сопряжением сравните отпечаток сертификата на телефоне и телевизоре.", 13f, secondary))
     }
 
+    @Deprecated("MediaProjection result uses the legacy Activity API for Android TV compatibility")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != captureRequest) return
+        if (resultCode != RESULT_OK || data == null) {
+            info.text = "Разрешение на трансляцию не выдано"
+            return
+        }
+        val serviceIntent = Intent(this, ScreenCaptureService::class.java).apply {
+            action = ScreenCaptureService.ACTION_START
+            putExtra(ScreenCaptureService.EXTRA_RESULT, resultCode)
+            putExtra(ScreenCaptureService.EXTRA_DATA, data)
+        }
+        if (Build.VERSION.SDK_INT >= 26) startForegroundService(serviceIntent)
+        else startService(serviceIntent)
+    }
+
     override fun onResume() {
         super.onResume()
         handler.removeCallbacks(refresh)
@@ -124,6 +161,7 @@ class MainActivity : Activity() {
         info.text = "Служба управления: ${if (active) "ВКЛЮЧЕНА" else "ВЫКЛЮЧЕНА"}\n" +
             "Сервер: ${CompanionServer.status}\n" +
             "Соединение: ${CompanionServer.connectionDiagnostic}\n" +
+            "Экран: ${ScreenCaptureService.status}\n" +
             "IP: $ip    Порт: ${CompanionServer.PORT}\n" +
             "Отпечаток SHA-256:\n$fingerprintText"
         val pin = pairing.visiblePin()
