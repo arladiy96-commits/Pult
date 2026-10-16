@@ -54,7 +54,9 @@ class _TvCompanionScreenState extends State<TvCompanionScreen>
   DateTime? _screenPanStarted;
   double _screenScrollDistance = 0;
   bool _screenDidScroll = false;
+  DateTime _screenLastScroll = DateTime.fromMillisecondsSinceEpoch(0);
   Future<void>? _movementPending;
+  int _lastGestureRttMs = -1;
 
   _Panel panel = _Panel.mouse;
   String? pendingFingerprint;
@@ -180,7 +182,9 @@ class _TvCompanionScreenState extends State<TvCompanionScreen>
   void _onVideoStatus(String message, int width, int height) {
     if (!mounted || panel != _Panel.screen) return;
     setState(() {
-      _screenMessage = message;
+      _screenMessage = _lastGestureRttMs >= 0
+          ? '$message · отклик команды ${_lastGestureRttMs}мс'
+          : message;
       _screenWidth = width;
       _screenHeight = height;
     });
@@ -355,7 +359,13 @@ class _TvCompanionScreenState extends State<TvCompanionScreen>
       return null;
     }
     try {
+      // Response time is a control-channel RTT, not the full display latency.
+      final measure = panel == _Panel.screen &&
+          {'screen_tap', 'screen_long', 'screen_swipe', 'screen_scroll'}
+              .contains(cmd['cmd']);
+      final stopwatch = measure ? (Stopwatch()..start()) : null;
       final result = await client.request(cmd);
+      if (stopwatch != null) _lastGestureRttMs = stopwatch.elapsedMilliseconds;
       if (result['ok'] != true) throw StateError('${result['error'] ?? 'Команда отклонена'}');
       return result;
     } catch (e) {
@@ -687,7 +697,8 @@ class _TvCompanionScreenState extends State<TvCompanionScreen>
           // Scroll visible lists *during* the gesture, not only on finger-up.
           if (travel.dy.abs() > travel.dx.abs() * 1.4 && travel.dy.abs() > 18) {
             _screenScrollDistance += d.delta.dy;
-            if (_screenScrollDistance.abs() >= 62) {
+            if (_screenScrollDistance.abs() >= 85 &&
+                DateTime.now().difference(_screenLastScroll).inMilliseconds >= 140) {
               final point = _screenNormalize(d.localPosition, screenSize);
               if (point != null && connected) {
                 _command('screen_scroll', {
@@ -695,6 +706,7 @@ class _TvCompanionScreenState extends State<TvCompanionScreen>
                   'dy': _screenScrollDistance < 0 ? 1 : -1,
                 });
                 _screenDidScroll = true;
+                _screenLastScroll = DateTime.now();
               }
               _screenScrollDistance = 0;
             }
