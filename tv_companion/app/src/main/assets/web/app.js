@@ -168,5 +168,8 @@
   window.addEventListener('pageshow',()=>checkHealth());
   window.addEventListener('online',()=>checkHealth());
   healthTimer=setInterval(()=>{if(!document.hidden)checkHealth();},6000);
+  // All pages are hidden in HTML. The initial 'login' state alone does not make it visible.
+  // Render a page before the first asynchronous status response arrives.
+  show('login');
   checkHealth();
 })();
