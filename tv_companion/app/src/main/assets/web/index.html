@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=no">
+  <meta name="theme-color" content="#091522">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Пульт X96">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="description" content="Домашний пульт для приставки X96">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="stylesheet" href="/style.css">
+  <title>Пульт · X96</title>
+</head>
+<body>
+  <div class="app" id="app">
+    <header class="header">
+      <div class="brand"><div class="brand-icon">◈</div><div><strong>ПУЛЬТ</strong><small>Домашнее управление · X96</small></div></div>
+      <div id="statusBadge" class="status offline"><i></i><span id="statusLabel">Подключение…</span></div>
+    </header>
+
+    <main id="loginPage" class="login page hidden">
+      <div class="hero-sign">◉</div>
+      <h1>Подключение к X96</h1>
+      <p>На приставке откройте «Пульт · Приставка» и нажмите «Показать код на 2 минуты».</p>
+      <form id="pairForm" autocomplete="off">
+        <label for="pin">Код с экрана телевизора</label>
+        <input id="pin" type="text" inputmode="numeric" maxlength="6" pattern="[0-9]{6}" autocomplete="one-time-code" placeholder="000000" required>
+        <button class="primary" type="submit">Подключиться</button>
+      </form>
+      <div id="loginError" class="hint-error" role="alert"></div>
+      <p class="fineprint">Только домашний Wi-Fi. Веб-версия передаёт команды по локальному HTTP; не используйте её в чужих сетях.</p>
+    </main>
+
+    <main id="remotePage" class="page hidden">
+      <section class="device-panel">
+        <div class="device-id"><div class="ring">TV</div><div><strong>Android TV · X96</strong><small id="hostName">Домашняя приставка</small></div></div>
+        <div class="quick-row"><button data-action="mouse" class="quick-btn"><b>⌁</b><span>Мышь</span></button><button data-action="screen" class="quick-btn"><b>▣</b><span>Экран</span></button><button data-action="apps" class="quick-btn"><b>▦</b><span>Приложения</span></button><button data-action="keyboard" class="quick-btn"><b>⌨</b><span>Ввод</span></button></div>
+      </section>
+      <section class="pad-section">
+        <div class="section-label">НАВИГАЦИЯ <small>Кнопки D-pad работают там, где доступен Android Accessibility</small></div>
+        <div class="dpad">
+          <button class="nav up" data-key="19" aria-label="Вверх">⌃</button>
+          <button class="nav left" data-key="21" aria-label="Влево">〈</button>
+          <button class="nav ok" data-key="23" aria-label="ОК">OK</button>
+          <button class="nav right" data-key="22" aria-label="Вправо">〉</button>
+          <button class="nav down" data-key="20" aria-label="Вниз">⌄</button>
+        </div>
+      </section>
+      <div class="action-row"><button class="wide-btn" data-key="4">← &nbsp; Назад</button><button class="wide-btn" data-key="3">⌂ &nbsp; Домой</button><button class="wide-btn" data-key="187">▢ &nbsp; Недавние</button></div>
+      <div class="section-label">МЕДИА И ГРОМКОСТЬ</div>
+      <div class="media-row"><button data-key="88" aria-label="Предыдущий">|◀</button><button data-key="85" aria-label="Воспроизвести / пауза">▶Ⅱ</button><button data-key="87" aria-label="Следующий">▶|</button><div class="splitter"></div><button data-key="25" aria-label="Тише">−</button><button data-key="164" aria-label="Без звука">◌</button><button data-key="24" aria-label="Громче">＋</button></div>
+      <footer><button class="text-button" id="logout">Отключить iPhone</button></footer>
+    </main>
+
+    <main id="appsPage" class="page hidden inner-page"><div class="inner-title"><button class="back" data-action="remote">‹</button><h1>Приложения X96</h1><button class="back" data-action="refresh-apps">↻</button></div><div id="appsGrid" class="apps-grid"><p>Загрузка…</p></div></main>
+    <main id="keyboardPage" class="page hidden inner-page"><div class="inner-title"><button class="back" data-action="remote">‹</button><h1>Ввод текста</h1></div><p class="subtext">Откройте поле на телевизоре. Для русского ввода включите на X96 клавиатуру «Пульт · ввод с телефона».</p><form id="textForm"><textarea id="textField" rows="4" placeholder="Текст для телевизора…" maxlength="4000"></textarea><button class="primary" type="submit">Отправить текст</button></form><button class="outline" id="deleteKey">⌫ Стереть символ</button></main>
+
+    <main id="mousePage" class="fullscreen hidden">
+      <div id="touchpad" class="touchpad" aria-label="Полноэкранная мышь"><div class="touch-hint">◉<strong>ТАЧПАД</strong><small>1 палец — курсор · 2 пальца — прокрутка<br>Удержание — перетаскивание</small></div></div>
+      <div class="float-top"><button data-action="remote">‹</button><div class="float-label">МЫШЬ · X96</div><button data-action="screen">▣</button><button data-action="keyboard">⌨</button></div>
+      <div id="scrollStrip" class="scroll-strip"><span>⌃</span><span>⇅</span><span>⌄</span></div>
+      <div class="float-bottom"><button data-key="4">Назад</button><button data-key="3">Домой</button><button data-cmd="tap">Клик</button><button data-cmd="hide_cursor">Скрыть</button></div>
+    </main>
+
+    <main id="screenPage" class="fullscreen video-page hidden">
+      <div class="video-container" id="videoTouchArea"><video id="tvVideo" autoplay muted playsinline disablepictureinpicture controlslist="nodownload noremoteplayback" webkit-playsinline></video><div class="video-info" id="videoInfo">Подключаем видеопоток…</div></div>
+      <div class="float-top video-toolbar"><button data-action="remote">‹</button><button data-action="mouse">⌁</button><button data-action="keyboard">⌨</button><button id="videoFit">⤢</button><button data-action="refresh-video">↻</button><button id="toggleVideoUi">×</button></div>
+      <div class="float-bottom screen-bottom"><button data-key="4">Назад</button><button data-key="3">Домой</button><button data-cmd="scroll-up">Вверх</button><button data-cmd="scroll-down">Вниз</button></div>
+    </main>
+    <div class="toast hidden" id="toast" role="status"></div>
+  </div>
+  <script defer src="/video.js"></script>
+  <script defer src="/app.js"></script>
+</body>
+</html>

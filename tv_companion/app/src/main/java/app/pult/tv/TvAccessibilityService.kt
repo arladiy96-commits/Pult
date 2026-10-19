@@ -427,7 +427,45 @@ class TvAccessibilityService : AccessibilityService() {
         } finally { node.recycle() }
     }
 
+    /** Accessibility focus navigation for web D-pad where applications expose a focus tree.
+     * Some TV games/custom launchers require native key injection, which Accessibility
+     * cannot provide; they remain controllable by cursor and direct screen gestures.
+     */
+    private fun accessibilityDpad(code: Int): JSONObject {
+        val root = rootInActiveWindow ?: return fail("Приложение не поддерживает навигацию")
+        val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+            ?: root.findFocus(AccessibilityNodeInfo.FOCUS_ACCESSIBILITY)
+        try {
+            if (code == KeyEvent.KEYCODE_DPAD_CENTER) {
+                val target = focused ?: root
+                return if (target.performAction(AccessibilityNodeInfo.ACTION_CLICK)) ok()
+                    else if (gesture(cursorX, cursorY, cursorX, cursorY, 60L)) ok()
+                    else fail("Не удалось нажать ОК")
+            }
+            val direction = when (code) {
+                KeyEvent.KEYCODE_DPAD_UP -> View.FOCUS_UP
+                KeyEvent.KEYCODE_DPAD_DOWN -> View.FOCUS_DOWN
+                KeyEvent.KEYCODE_DPAD_LEFT -> View.FOCUS_LEFT
+                KeyEvent.KEYCODE_DPAD_RIGHT -> View.FOCUS_RIGHT
+                else -> return fail("Неизвестное направление")
+            }
+            val next = (focused ?: root).focusSearch(direction)
+                ?: return fail("Для этого приложения используйте мышь")
+            return try {
+                if (next.performAction(AccessibilityNodeInfo.ACTION_FOCUS) ||
+                    next.performAction(AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS)) ok()
+                else fail("Для этого приложения используйте мышь")
+            } finally { next.recycle() }
+        } finally {
+            focused?.recycle()
+            if (root !== focused) root.recycle()
+        }
+    }
+
     private fun key(code: Int): JSONObject {
+        if (code in listOf(KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN,
+                KeyEvent.KEYCODE_DPAD_LEFT, KeyEvent.KEYCODE_DPAD_RIGHT,
+                KeyEvent.KEYCODE_DPAD_CENTER)) return accessibilityDpad(code)
         val action = when (code) {
             KeyEvent.KEYCODE_BACK -> GLOBAL_ACTION_BACK
             KeyEvent.KEYCODE_HOME -> GLOBAL_ACTION_HOME

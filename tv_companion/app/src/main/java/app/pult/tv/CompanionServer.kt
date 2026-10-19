@@ -43,9 +43,11 @@ class CompanionServer(context: Context, private val accessibility: TvAccessibili
     private val executor = Executors.newCachedThreadPool()
     @Volatile private var running = false
     @Volatile private var listener: SSLServerSocket? = null
+    private val web = WebRemoteServer(context, pairing, ::execute)
 
     fun start() {
         running = true
+        web.start()
         executor.execute {
             try {
                 val ss = SecureTransport.serverSocket(PORT)
@@ -66,6 +68,7 @@ class CompanionServer(context: Context, private val accessibility: TvAccessibili
 
     fun stop() {
         running = false
+        web.stop()
         try { listener?.close() } catch (_: Exception) { }
         executor.shutdownNow()
         status = "Служба остановлена"

@@ -57,7 +57,7 @@ class MainActivity : Activity() {
         setContentView(scroll)
 
         root.addView(label("ПУЛЬТ · ПРИСТАВКА", 27f, cyan, true))
-        root.addView(label("Служба управления X96 по Wi-Fi · версия 0.1.0", 15f, secondary))
+        root.addView(label("Служба управления X96 по Wi-Fi · версия 0.3.0", 15f, secondary))
         gap(root, 20)
 
         info = label("Проверка службы…", 17f, text)
@@ -99,6 +99,11 @@ class MainActivity : Activity() {
             })
         }
         gap(root, 18)
+        root.addView(label("ВЕБ-ПУЛЬТ ДЛЯ iPHONE", 21f, cyan, true))
+        root.addView(label("В Safari откройте http://IP-ПРИСТАВКИ:8088 и введите код ниже. " +
+            "Работает только в доверенной домашней Wi-Fi сети: веб-версия использует HTTP, " +
+            "Android-пульт продолжает использовать защищённый TLS.", 14f, secondary))
+        gap(root, 14)
         root.addView(label("СОПРЯЖЕНИЕ", 21f, cyan, true))
         root.addView(label("Телефон и приставка должны быть в одной локальной сети. Откройте окно сопряжения только когда готовы вводить код.", 14f, secondary))
         gap(root, 7)
@@ -120,7 +125,7 @@ class MainActivity : Activity() {
         }
         gap(root, 12)
         root.addView(label("Android 13: при блокировке специальных возможностей откройте «О приложении» → ⋮ → «Разрешить ограниченные настройки», затем повторите включение.", 13f, secondary))
-        root.addView(label("Соединение защищено TLS. Перед первым сопряжением сравните отпечаток сертификата на телефоне и телевизоре.", 13f, secondary))
+        root.addView(label("Android-пульт защищён TLS: сравните отпечаток сертификата. Веб-пульт для iPhone работает только в доверенной локальной сети через HTTP.", 13f, secondary))
     }
 
     @Deprecated("MediaProjection result uses the legacy Activity API for Android TV compatibility")
@@ -160,6 +165,7 @@ class MainActivity : Activity() {
         } catch (e: Exception) { "Недоступен: ${e.javaClass.simpleName}" }
         info.text = "Служба управления: ${if (active) "ВКЛЮЧЕНА" else "ВЫКЛЮЧЕНА"}\n" +
             "Сервер: ${CompanionServer.status}\n" +
+            "Веб-пульт: http://${ip.substringBefore(" /")}:${WebRemoteServer.PORT} · ${WebRemoteServer.status}\n" +
             "Соединение: ${CompanionServer.connectionDiagnostic}\n" +
             "Экран: ${ScreenCaptureService.status}\n" +
             "IP: $ip    Порт: ${CompanionServer.PORT}\n" +

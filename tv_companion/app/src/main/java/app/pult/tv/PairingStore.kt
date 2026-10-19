@@ -44,6 +44,26 @@ class PairingStore(context: Context) {
         return token
     }
 
+    /** Web logins do not rotate the Android app's existing trusted token. */
+    @Synchronized fun consumeWebPin(candidate: String): Boolean {
+        val now = System.currentTimeMillis()
+        if (now < blockedUntil || visiblePin() == null) return false
+        if (candidate != pin) {
+            failed++
+            if (failed >= 5) {
+                blockedUntil = now + 60_000L
+                pin = null
+            }
+            return false
+        }
+        pin = null
+        expiresAt = 0
+        failed = 0
+        return true
+    }
+
+    @Synchronized fun webRevocationVersion(): Long = prefs.getLong("web_revoked_at", 0L)
+
     @Synchronized fun authenticated(input: String): Boolean {
         val existing = prefs.getString("trusted_token", null) ?: return false
         // Constant-time comparison for equal-length secrets.
@@ -51,7 +71,8 @@ class PairingStore(context: Context) {
     }
 
     @Synchronized fun revoke() {
-        prefs.edit().remove("trusted_token").apply()
+        prefs.edit().remove("trusted_token")
+            .putLong("web_revoked_at", System.currentTimeMillis()).apply()
         pin = null
         expiresAt = 0
     }
