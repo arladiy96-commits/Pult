@@ -2,6 +2,11 @@ name: Build TV Companion APK
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'tv_companion/**'
+      - '.github/workflows/build_tv_companion.yml'
 
 permissions:
   contents: write
